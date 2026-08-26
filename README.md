@@ -18,12 +18,35 @@ capture path. This README is the map; `NOTES.md` is the lab notebook.
 cuda/build.sh
 
 # run the live server
-python3 server.py -p 8090
+python3 server.py
 # -> http://<jetson-ip>:8090/
 ```
 
-Default port is 8080 in `server.py`'s `--help`, but 8090 is what's actually
-in use here -- 8080 is taken by an unrelated local service (`openshell-gateway`).
+Default port is 8090 (8080 is taken by an unrelated local service,
+`openshell-gateway`).
+
+### Running as a service (recommended)
+
+A manually-launched `python3 server.py` dies with its SSH session -- lost
+this way once already (see NOTES.md, the NetBird incident). `deploy/adc-capture.service`
+runs it under systemd instead: starts on boot, restarts on crash, survives
+SSH/VPN drops entirely.
+
+```bash
+sudo systemctl link "$(pwd)/deploy/adc-capture.service"   # registers it from this repo path, no copy needed
+sudo systemctl daemon-reload
+sudo systemctl enable --now adc-capture.service
+```
+
+The web UI's **"Restart server"** button (Control panel) calls `POST
+/restart`, which releases the ADC/GPU cleanly and calls `os._exit(0)` --
+`Restart=always` in the unit is what actually brings it back. Without a
+supervisor configured that way, that button just kills the server for
+good, so don't wire it up without the service running.
+
+Useful commands: `sudo systemctl status adc-capture`,
+`journalctl -u adc-capture -f` (logs), `sudo systemctl restart adc-capture`
+(same effect as the UI button, from the shell).
 
 **Remote access over the NetBird VPN**: this host has a local `iptables`
 allowlist on the `wt0` (NetBird) interface, independent of whatever the
@@ -62,6 +85,7 @@ FPGA (block capture, DDR4)
 | `gpu.py` | ctypes bridge to `cuda/adcfft.cu`, pinned-buffer handling |
 | `cuda/adcfft.cu` | CUDA: Hann window, batched cuFFT R2C, power->dB, envelope |
 | `cuda/build.sh` | Builds `cuda/libadcfft.so` from `adcfft.cu` |
+| `deploy/adc-capture.service` | systemd unit -- see "Running as a service" above |
 | `server.py` | Acquisition loop + HTTP server (the live scope backend) |
 | `web/index.html` | Browser UI |
 | `adc_capture.py` | Standalone CLI: capture N samples, save/summarize |

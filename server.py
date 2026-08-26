@@ -408,7 +408,21 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/control":
+        p = self.path.split("?")[0]
+        if p == "/restart":
+            # Ack first, THEN release hardware and exit -- os._exit() so no
+            # atexit/signal handling delays it further. Relies on a
+            # supervisor (systemd, Restart=always) to actually bring the
+            # process back; without one this just stops the server for good.
+            self._send(200, b'{"ok":true,"restarting":true}', "application/json")
+            def _restart():
+                try:
+                    self.engine.stop()
+                finally:
+                    os._exit(0)
+            threading.Thread(target=_restart, daemon=True).start()
+            return
+        if p != "/control":
             return self._send(404, b"not found", "text/plain")
         n = int(self.headers.get("Content-Length", 0))
         try:
@@ -423,7 +437,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-p", "--port", type=int, default=8080)
+    ap.add_argument("-p", "--port", type=int, default=8090)  # 8080 is taken
+                                                              # by openshell-gateway
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("-n", "--nsamples", type=int, default=1 << 20)
     ap.add_argument("-c", "--channel", type=int, default=1)

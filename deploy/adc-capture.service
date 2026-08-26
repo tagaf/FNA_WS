@@ -1,0 +1,17 @@
+[Unit]
+Description=AD9643 live capture/spectrum web server
+After=network.target
+
+[Service]
+Type=simple
+User=btiagx
+WorkingDirectory=/home/btiagx/adc_capture
+ExecStart=/usr/bin/python3 /home/btiagx/adc_capture/server.py
+# Restart=always (not on-failure): the in-page "Restart server" button makes
+# the process exit(0) on purpose to get a full clean restart -- on-failure
+# would treat that as a successful stop and NOT bring it back.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
