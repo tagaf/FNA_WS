@@ -170,6 +170,27 @@ regardless (defends against a different, real failure mode: the DMA
 subprocess itself stalling), but it was not the explanation for the original
 hangs.
 
+**`DmaTimeout` confirmed firing for real in normal single-instance use,
+2026-08-26 (later)**: user reported hitting it "often" at the *default*
+config (1,048,576 samples / 2,097,152 B — nowhere near MAX_SAMPLES). Checked
+live: exactly one `server.py` instance running (concurrent-access explanation
+above ruled out for this case), no PCIe/XDMA errors in `dmesg`, load average
+normal, 3 timeouts in 3,014 frames. Resumed continuous capture at the same
+config and ran 4,500 more frames (~100s at ~46fps) immediately after with
+**zero** recurrences — genuinely rare and not reproducible on demand, but
+real and size-independent (contradicts the earlier "near-MAX_SAMPLES only"
+framing — see updated `DmaTimeout` docstring in `ad9643.py`). Root cause
+still unknown.
+
+Practical consequence: the timeout bound had a flat `+5.0s` margin sized for
+worst-case (500 MB) transfers, so a stall on a typical few-MB capture made
+the ~50 fps continuous loop stutter for a full 5s before recovering.
+Tightened to `+1.5s` (1.0s absolute floor) — still >100x the normal small-
+capture time, but recovers far faster when it does fire. If `DmaTimeout`
+starts firing noticeably *more* often after this, that's a real signal (the
+margin is now tighter); if the rate looks the same, the margin was pure
+overhead being cut for no cost.
+
 ## Operational notes
 
 - **A hang is recoverable.** Re-arming with a valid channel and re-triggering

@@ -55,12 +55,16 @@ class CaptureTimeout(RuntimeError):
 class DmaTimeout(RuntimeError):
     """The vendor dma_from_device/dma_to_device CLI did not finish in time.
 
-    Seen intermittently on very large (near-MAX_SAMPLES) transfers during
-    testing 2026-08-26: the same capture succeeded in ~2.7s on one run and
-    did not return within 90+ seconds (no error, no child process, no CPU
-    use -- see NOTES.md) on two others, with no reliable repro found. Root
-    cause is not understood. This bounds the wait so a recurrence fails
-    loudly and recoverably instead of wedging the acquisition loop forever."""
+    Seen intermittently at ALL transfer sizes, not just large ones: first
+    observed near MAX_SAMPLES during testing 2026-08-26 (same capture
+    succeeded in ~2.7s once, didn't return within 90+ seconds twice, no
+    error/child process/CPU use -- see NOTES.md), then again the same day
+    on ordinary 2 MB default-config captures during normal continuous use
+    (~3 times in ~3000 frames; a fresh 4500-frame run right after couldn't
+    reproduce it on demand). So it's size-independent and genuinely rare
+    -- not something tied to extreme settings. Root cause still not
+    understood. This bounds the wait so a recurrence fails loudly and
+    recoverably instead of wedging the acquisition loop forever."""
 
 
 def sample_rate(speed=0):
@@ -169,8 +173,13 @@ def _tool(name, dev, addr, nbytes, path, write=False, timeout=None):
     # Measured throughput on this path is 0.3-0.7 GB/s; floor the estimate
     # far below that (50 MB/s) so the bound stays generous for legitimate
     # large transfers while still catching a genuine stall in finite time.
+    # The +5.0s flat margin this used to carry was sized for the largest
+    # transfers and made small/typical captures (a few ms normally) wait a
+    # full 5s before recovering from a stall -- a very visible stutter in a
+    # ~50 fps continuous loop. +1.5s is still >100x the normal small-capture
+    # time; 1.0s absolute floor in case nbytes is tiny.
     if timeout is None:
-        timeout = max(5.0, nbytes / 50e6 + 5.0)
+        timeout = max(1.0, nbytes / 50e6 + 1.5)
     try:
         subprocess.run([f"{TOOLS}/{name}", "-d", dev, "-a", str(addr),
                         "-s", str(nbytes), "-f", path],
