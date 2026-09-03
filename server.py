@@ -728,6 +728,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     self.engine.stop()
                 finally:
+                    A._xfer_cleanup()      # os._exit() skips atexit
                     os._exit(0)
             threading.Thread(target=_restart, daemon=True).start()
             return
@@ -877,6 +878,7 @@ def main():
               "\n  python3 server.py --replace\n", file=sys.stderr)
         return 1
 
+    A._xfer_reap_stale()      # clear tmpfs files stranded by earlier crashes
     eng = Engine(nsamples=a.nsamples, channel=a.channel, nfft=a.nfft,
                  min_period=a.min_period, fast_dma=a.fast_dma, mock=a.mock)
     eng.start()
@@ -884,6 +886,13 @@ def main():
     srv, port = bind_server(a.bind, a.port)
     if lock:
         lock.write(f"{os.getpid()} {port}\n"); lock.flush()
+
+    # systemd's `stop` sends SIGTERM, whose default action kills the process
+    # without unwinding -- so the finally block below (release ADC/GPU, drop
+    # the lock, delete the tmpfs transfer file) never ran. Turn it into the
+    # same clean unwind as Ctrl-C.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(
+        KeyboardInterrupt()))
 
     print(f"serving on port {port}  (ctrl-C to stop)")
     for u in local_urls(port):

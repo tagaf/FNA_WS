@@ -202,6 +202,33 @@ def _xfer_cleanup():
     except OSError:
         pass
 
+
+def _xfer_reap_stale():
+    """Remove transfer files left by processes that no longer exist.
+
+    These live on tmpfs (RAM). A SIGTERM (systemctl stop) or the /restart
+    button's os._exit() both bypass atexit, so each restart used to strand
+    one file sized to that session's largest capture - up to 500 MB each,
+    accumulating until reboot."""
+    import glob, re
+    for p in glob.glob(os.path.join(_XFER_DIR, "adc_dma_*.bin")) + \
+             glob.glob(os.path.join(_XFER_DIR, "adc_helper_*.buf")):
+        m = re.search(r"_(\d+)\.(bin|buf)$", p)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 0)          # still alive: leave it alone
+        except ProcessLookupError:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        except PermissionError:
+            pass                     # someone else's live process
+
 import atexit
 atexit.register(_xfer_cleanup)
 
