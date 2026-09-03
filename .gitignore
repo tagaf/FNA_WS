@@ -4,3 +4,4 @@ __pycache__/
 cuda/*.so
 bisect_marker.txt
 *.log
+native/xdma_shm_reader

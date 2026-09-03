@@ -219,3 +219,144 @@ the following remain open:
 
 The current FFT peaks (107.17 MHz on A, 50.00 MHz on B) are noise-floor
 artefacts at −62 and −67 dB, not signals.
+
+## 8. Efficiency + fluency pass, 2026-09-03
+
+**"avg=1 still averages" — root cause.** Two averaging stages exist: the CUDA
+`k_pow` kernel averages |X|² across `max_frames` Welch segments *inside every
+capture*, and the Python EMA averages *across* captures. The UI only exposed
+the EMA ("Avg depth"); `max_frames` was hard-wired to 64, so avg=1 still
+showed a 64-segment average. Fixed by exposing it ("FFT frames"); validated
+end-to-end in mock mode: Welch=1 gives 4.9 dB frame-to-frame noise-floor
+wobble (a true single FFT), Welch=64 gives 0.7 dB — matching χ² theory.
+avg=1 in the EMA now also hard-copies instead of blending.
+
+**Web stutter — three independent causes fixed:**
+1. DMA tempfiles lived on /tmp (disk-backed): megabytes/frame through the
+   page cache; periodic writeback = multi-hundred-ms stalls. Moved to
+   /dev/shm, one persistent file, `readinto` a preallocated buffer
+   (`ad9643.ddr_read_into`) — no per-frame allocation.
+2. Nagle + delayed-ACK on the HTTP socket: up to ~40 ms per small reply,
+   and the UI polls /status every animation frame.
+   `disable_nagle_algorithm=True`; /status now ~1.3 ms.
+3. The client reallocated both canvas backing stores every frame
+   (`cv.width=` resets the whole canvas); now only on genuine resize.
+
+**Resident DMA helper (`native/xdma_shm_reader`), opt-in `--fast-dma`.**
+Replicates the vendor tool's device access *exactly* — same
+`open(O_RDWR|O_TRUNC)` (the Python freeze path used O_RDONLY; the vendor
+comment says O_TRUNC tells the driver to flush — a real candidate for the §5
+divide), same posix_memalign(4096) bounce buffer, same chunked lseek+read
+loop and RW_MAX_SIZE — but stays resident and memcpys into a /dev/shm
+mapping instead of spawning a process + writing a file per frame. One vendor
+bug fixed on the way: `read_to_buffer` only seeks `if (offset)`, which is
+wrong once the fd persists across reads (addr=0 after a prior read starts
+from the wrong position); the helper always seeks. Protocol validated
+against a pattern file (incl. that regression). **NOT yet validated against
+the real device** — run `validate_fast_dma.py` (server stopped) once; only
+on PASS use `--fast-dma`. Any runtime helper failure permanently falls back
+to the vendor CLI and is reported in the `dma_path` metric.
+
+**Other:** CUDA mid-pipeline `cudaStreamSynchronize` removed (mean consumed
+on-device); EMA accumulator float32 (halves memory, matters at 128M-point
+FFTs); noise-floor median strided (full median over 67M bins was ~0.5 s per
+frame); stale `engine.err` now clears on the next successful capture;
+`--mock` runs the whole server on a synthetic 25 MHz tone without opening
+/dev/* (65 fps measured; also how this pass was tested — per standing
+instruction the live server is only ever started by the user).
+
+## 9. Stutter root-caused to the WiFi link; long-poll delivery, 2026-09-03
+
+Probe of the live service (35 s, localhost): engine inter-frame p99 within
+8% of median, zero skipped frames — production and local delivery are
+smooth. The link is not: wlP1p1s0 at **-75 dBm, tx bitrate fallen to
+6 Mbit/s, power save ON** — periodic PS wakeups/retry bursts are the
+every-few-seconds stutter. All viewing traffic rides this uplink (no
+Ethernet configured; Tailscale rides the same RF).
+
+App-side hardening shipped anyway: `/frame?wait=1&since=<n>` long-poll
+(server parks the request on a Condition until a newer frame exists, 204
+after 25 s) replaces the status-poll-per-animation-frame client — ~10x
+fewer round-trips, and an RF hiccup now delays one response instead of a
+burst. Mock-verified: 1 request/frame, parks while paused, wakes <100 ms
+after resume.
+
+Same pass: `trace_samples` decouples the time trace from Welch depth (new
+trace_n arg through adc_process/k_env; changing FFT frames no longer
+changes trace span or shading — mock-verified identical envelopes at
+Welch 1 vs 256); readback = max(FFT need, trace, explicit), rounded UP to
+granularity, clamped to N; time-axis labels auto-scale ns/µs/ms/s; sample
+and trace selector labels show real duration at the current divider; the
+Samples control is now honestly "capture depth" (metrics show
+acquired/FFT/trace splits — at N=67M with Welch=1×4096 only 0.006% of the
+record was ever used, which is why the control "did nothing").
+
+## 10. Control-matrix test; EMA cross-config bug; samples→FFT link, 2026-09-03
+
+Mock-mode control matrix (11 configs × invariants: fs, nbins, bin_hz,
+display-span == fs/2, displayed-argmax vs expected tone incl. alias at
+divided rates, trace/read/fft splits, nframes, zoom slice mapping,
+single-shot, ch=3 reject/recover): ALL PASS. MockDma now emulates the
+FPGA's sample-dropping decimator (reads REG_SPEED from MockAdc), so
+divided-rate cases assert physically correct alias frequencies.
+
+The matrix caught a REAL bug: after a config change, frames produced under
+the OLD config could re-seed the display EMA after configure()'s reset;
+spectra from different fs/nfft share bin indices, so a stale 6.25 MHz peak
+(speed=7) displayed as 50 MHz at speed=0 for ~avg frames. Fix: the
+accumulator carries a (fs, nfft, channel) tag and reseeds on mismatch —
+"peak at wrong frequency right after changing speed/nfft" is gone.
+
+"Changing samples doesn't change the FFT axis": correct observation, by
+design frequency span depends only on fs — but the user wants record
+length to drive RESOLUTION. New default nfft = "auto — follow samples":
+nfft = pow2floor(min(N, 2^24)), sent by the UI whenever samples change, so
+more samples → finer bins → log axis reaches lower (a real "longer
+analysis"). Manual sizes still selectable.
+
+Header now shows the Orin's own WiFi link (RSSI bars + tx bitrate via
+/proc/net/wireless + iw, 5 s cache, in sys.net) plus a client-measured
+"lag" (frame arrival delay beyond engine loop time, EWMA). On frame-rate
+adaptation: the long-poll transport is already self-pacing — the client
+pulls and the server hands the NEWEST frame, so a slow link yields fewer,
+current frames rather than a growing backlog; the badge makes that state
+visible instead of mysterious.
+
+## 11. Resolution follows the record, 2026-09-03 (cont.)
+
+User expectation formalised: Δf = 1/T_analysed. NFFT_AUTO_CAP raised
+2^24 → 2^27 after GPU validation (134,217,728-pt R2C: 116 ms process,
+~1 GB, on 61 GB total) — auto nfft = pow2floor(N) now over the ENTIRE
+sample range, so a longer record genuinely yields finer bins all the way
+to the 500 MB window (N=262M → 134M-pt FFT → Δf 1.86 Hz). `need` is now
+capped by the frames the record can supply (min(max_frames, N//nfft)·nfft)
+so nfft≈N no longer forces a full-window DMA it cannot use. Spectrum
+header states the law explicitly: "N-pt (T → Δf) · analysed X of Y".
+Mock proof: 16.7M-pt full-record FFT resolves the 25 MHz tone to 0.3 bins
+(±4.5 Hz) at Δf=14.9 Hz. Semantics recap — Samples: acquisition depth
+(DDR record, sets available T). FFT auto: analysis length (resolution).
+Trace length: time-plot display window only. Welch frames: how many
+nfft-segments of the record are averaged (variance ↓, resolution
+unchanged). Decimating a record into a small FFT would instead shrink
+span fs/2 and alias (no AA filter) — deliberately not offered.
+
+## 12. The 31 kHz floor; trace knob removed, 2026-09-03 (cont.)
+
+User: "minimum of the FFT spectrum is always 31 kHz". Correct — a display
+artifact: the overview sent to the browser was 4096 points spaced LINEARLY
+over 0..fs/2, so its first point sat at 125 MHz/4096 = 30.5 kHz no matter
+how long the FFT. The added resolution existed in the data (zoom proved
+it) but never on the overview axis. Fix: `log_display()` — the overview is
+now 4096 points uniform in log(f) from the TRUE first bin (Δf) to Nyquist
+(max-pooled per point, so peaks survive), and the client maps them
+linearly onto its log axis. The axis now genuinely starts at Δf: 14.9 Hz
+at a 16.7M-pt FFT, 1.86 Hz at 2^27. Metadata disp_bin_hz replaced by
+disp_log/disp_f0/disp_f1; matrix test asserts disp_f0==bin_hz and that the
+displayed argmax lands at the correct frequency (incl. coarse-FFT cases
+where one bin spans several log points).
+
+Trace length control removed (user: samples+rate already define the
+record). The time plot now always shows the WHOLE record: trace_samples
+default -1 = follow N (explicit counts still accepted over /control).
+The knob was compensating for auto-readback reading less than the record;
+with nfft following the record that readback happens anyway.

@@ -189,12 +189,38 @@ def _tool(name, dev, addr, nbytes, path, write=False, timeout=None):
             f"{name} did not finish within {timeout:.1f}s for {nbytes:,} B "
             f"on {dev}. See ad9643.DmaTimeout docstring / NOTES.md.")
 
+# Persistent transfer file on tmpfs. /dev/shm keeps the vendor tool's output
+# entirely in RAM: with the old NamedTemporaryFile on /tmp (disk-backed here),
+# every frame pushed megabytes through the page cache to storage, and periodic
+# writeback flushes showed up as multi-hundred-ms stalls in the live loop.
+_XFER_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+_XFER_PATH = os.path.join(_XFER_DIR, f"adc_dma_{os.getpid()}.bin")
+
+def _xfer_cleanup():
+    try:
+        os.unlink(_XFER_PATH)
+    except OSError:
+        pass
+
+import atexit
+atexit.register(_xfer_cleanup)
+
+
 def ddr_read_samples(nsamples, addr=0, dev=C2H_DEV):
     nbytes = nsamples * BYTES_PER_SAMPLE
-    with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-        _tool("dma_from_device", dev, addr, nbytes, f.name)
-        d = np.fromfile(f.name, dtype='<u2')
-    return d
+    _tool("dma_from_device", dev, addr, nbytes, _XFER_PATH)
+    return np.fromfile(_XFER_PATH, dtype='<u2', count=nsamples)
+
+
+def ddr_read_into(out, nsamples, addr=0, dev=C2H_DEV):
+    """Like ddr_read_samples but into a preallocated uint16 array -
+    no per-frame allocation. Returns samples actually read."""
+    nbytes = nsamples * BYTES_PER_SAMPLE
+    _tool("dma_from_device", dev, addr, nbytes, _XFER_PATH)
+    with open(_XFER_PATH, "rb", buffering=0) as f:
+        got = f.readinto(memoryview(out[:nsamples]).cast("B") if out.ndim == 1
+                         else memoryview(out).cast("B")[:nbytes])
+    return got // BYTES_PER_SAMPLE
 
 def ddr_write(data, addr=0, dev=H2C_DEV):
     with tempfile.NamedTemporaryFile(suffix=".bin") as f:

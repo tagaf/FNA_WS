@@ -56,9 +56,9 @@ __global__ void k_stats_fin(float*part,int nb,float*out,int n){
 
 // convert + DC-remove + window, framed for the batched FFT
 __global__ void k_win(const unsigned short*x,float*y,const float*w,
-                      int nfft,int frames,float mean){
+                      int nfft,int frames,const float*stats){
     int i=blockIdx.x*blockDim.x+threadIdx.x, tot=nfft*frames;
-    if(i<tot) y[i]=((float)x[i]-mean)*w[i%nfft];
+    if(i<tot) y[i]=((float)x[i]-stats[2])*w[i%nfft];   // stats[2] = mean
 }
 
 // average |X|^2 across frames
@@ -121,9 +121,10 @@ unsigned short* adc_hostbuf(FftCtx*c){ return c->h_in; }
 int adc_nbins(FftCtx*c){ return c->nbins; }
 int adc_maxframes(FftCtx*c){ return c->max_frames; }
 
-int adc_process(FftCtx*c,int nsamples,int max_frames,
+int adc_process(FftCtx*c,int nsamples,int max_frames,int trace_n,
                 float*spec,float*tmin,float*tmax,float*stats,float*times,int*nframes_out){
     int nfft=c->nfft, frames=nsamples/nfft;
+    if(trace_n<=0||trace_n>nsamples) trace_n=nsamples;   // envelope span, decoupled from FFT
     if(frames<1) return -1;
     if(frames>max_frames) frames=max_frames;
     if(frames>c->max_frames) frames=c->max_frames;
@@ -144,13 +145,13 @@ int adc_process(FftCtx*c,int nsamples,int max_frames,
     int nb=64;
     k_stats<<<nb,MAXB,0,c->s>>>(c->d_raw,nsamples,c->d_part);
     k_stats_fin<<<1,1,0,c->s>>>(c->d_part,nb,c->d_part+4*MAXB,nsamples);
-    float h_stats[5];
-    cudaMemcpyAsync(h_stats,c->d_part+4*MAXB,5*sizeof(float),cudaMemcpyDeviceToHost,c->s);
-    cudaStreamSynchronize(c->s);
 
     int tot=nfft*frames;
-    k_win<<<(tot+255)/256,256,0,c->s>>>(c->d_raw,c->d_f,c->d_win,nfft,frames,h_stats[2]);
-    k_env<<<c->tw,MAXB,0,c->s>>>(c->d_raw,nsamples,c->d_tmin,c->d_tmax,c->tw);
+    // mean is read on-device (stats[2]) - no host round-trip, no mid-pipeline
+    // cudaStreamSynchronize stalling the stream every frame
+    k_win<<<(tot+255)/256,256,0,c->s>>>(c->d_raw,c->d_f,c->d_win,nfft,frames,
+                                        c->d_part+4*MAXB);
+    k_env<<<c->tw,MAXB,0,c->s>>>(c->d_raw,trace_n,c->d_tmin,c->d_tmax,c->tw);
     cudaEventRecord(c->e2,c->s);
 
     cufftExecR2C(c->plan,c->d_f,d_c);
@@ -162,6 +163,8 @@ int adc_process(FftCtx*c,int nsamples,int max_frames,
     cudaMemcpyAsync(spec,c->d_spec,(size_t)c->nbins*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmin,c->d_tmin,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmax,c->d_tmax,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
+    float h_stats[5];
+    cudaMemcpyAsync(h_stats,c->d_part+4*MAXB,5*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaEventRecord(c->e4,c->s);
     cudaStreamSynchronize(c->s);
 

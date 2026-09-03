@@ -51,6 +51,7 @@ _l.adc_nbins.argtypes = [ctypes.c_void_p]; _l.adc_nbins.restype = ctypes.c_int
 _l.adc_maxframes.argtypes = [ctypes.c_void_p]; _l.adc_maxframes.restype = ctypes.c_int
 _F = ctypes.POINTER(ctypes.c_float)
 _l.adc_process.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_int,
                            _F, _F, _F, _F, _F, ctypes.POINTER(ctypes.c_int)]
 _l.adc_process.restype = ctypes.c_int
 _l.adc_destroy.argtypes = [ctypes.c_void_p]
@@ -101,9 +102,12 @@ class Spectrum:
     def _p(self, a):
         return a.ctypes.data_as(_F)
 
-    def process(self, nsamples, max_frames=64):
+    def process(self, nsamples, max_frames=64, trace_n=0):
+        """trace_n: samples the min/max envelope covers (0 = all of nsamples).
+        Decoupled from the FFT so changing Welch depth no longer changes the
+        time-trace span or shading."""
         nf = ctypes.c_int()
-        rc = _l.adc_process(self.h, nsamples, max_frames,
+        rc = _l.adc_process(self.h, nsamples, max_frames, trace_n,
                             self._p(self.spec), self._p(self.tmin), self._p(self.tmax),
                             self._p(self.stats), self._p(self.times), ctypes.byref(nf))
         if rc != 0:

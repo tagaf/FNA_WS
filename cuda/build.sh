@@ -15,5 +15,5 @@ NVCC="${NVCC:-nvcc}"
 command -v "$NVCC" >/dev/null 2>&1 || NVCC=/usr/local/cuda/bin/nvcc
 [ -x "$NVCC" ] || { echo "nvcc not found -- set NVCC=/path/to/nvcc" >&2; exit 1; }
 
-"$NVCC" -O3 -shared -Xcompiler -fPIC -o libadcfft.so adcfft.cu -lcufft
+"$NVCC" -O3 -arch=sm_87 -shared -Xcompiler -fPIC -o libadcfft.so adcfft.cu -lcufft
 echo "built cuda/libadcfft.so"

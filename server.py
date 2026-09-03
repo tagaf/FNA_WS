@@ -15,6 +15,7 @@ which is the one path bisect_dma.py confirmed completes without freezing.
 See NOTES.md and bisect_marker.txt.
 """
 import json, os, struct, sys, threading, time, argparse
+import errno, fcntl, signal, socket, subprocess
 import numpy as np
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -22,7 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ad9643 as A
 import gpu
 
-WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+HERE = os.path.dirname(os.path.abspath(__file__))
+WEB = os.path.join(HERE, "web")
 
 # The full-resolution spectrum (nfft/2+1 bins, up to ~67M at max FFT size) is
 # always computed on the GPU -- that part is fast (see NOTES.md). What was
@@ -33,6 +35,26 @@ WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 # the same multi-hundred-MB payload).
 DISP_BINS = 4096
 ZOOM_MAX_BINS = 1 << 20
+
+
+def log_display(shown, bin_hz, out_n):
+    """Max-pool the spectrum onto out_n points spaced uniformly in log(f),
+    from the first bin (f0 = bin_hz) to Nyquist. A linear-in-frequency
+    overview capped at out_n points pins its first point to fs/2/out_n
+    (~31 kHz at 250 Msps) regardless of FFT length -- the low decades that a
+    long record buys were invisible. Log spacing gives them true per-bin
+    detail; the top decades pool many bins per point (max-pooled, so peaks
+    survive). Display point k covers log-fraction [k/out_n,(k+1)/out_n] of
+    [log f0, log f1] -- the client maps it linearly onto its log axis."""
+    nb = len(shown)
+    if nb < 4:
+        d = shown[1:].astype(np.float32, copy=True)
+        return d, bin_hz, max(1, nb - 1) * bin_hz
+    idx = np.power(10.0, np.linspace(0.0, np.log10(nb - 1), out_n + 1))
+    starts = np.floor(idx[:-1]).astype(np.int64)
+    starts = np.maximum.accumulate(np.clip(starts, 1, nb - 2)) - 1  # into shown[1:]
+    d = np.maximum.reduceat(shown[1:], starts).astype(np.float32)
+    return d, bin_hz, (nb - 1) * bin_hz
 
 
 def decimate_max(arr, out_n):
@@ -52,6 +74,14 @@ def decimate_max(arr, out_n):
 class SysMon:
     def __init__(self):
         self._prev = self._cpu()
+        self.wifi_if = None
+        try:
+            for line in open("/proc/net/wireless"):
+                if ":" in line:
+                    self.wifi_if = line.split(":")[0].strip()
+        except OSError:
+            pass
+        self._wifi_rate = [0.0, 0.0]     # [tx_mbps, last-checked]
         self.zones = []
         base = "/sys/class/thermal"
         if os.path.isdir(base):
@@ -91,22 +121,228 @@ class SysMon:
                     mem[k] = int(v.split()[0]) * 1024
         except OSError:
             pass
-        return {"cpu_pct": round(cpu, 1), "temps": temps,
+        net = None
+        if self.wifi_if:
+            try:
+                for line in open("/proc/net/wireless"):
+                    if line.strip().startswith(self.wifi_if + ":"):
+                        p = line.split()
+                        net = {"iface": self.wifi_if,
+                               "rssi_dbm": float(p[3].rstrip("."))}
+            except (OSError, ValueError, IndexError):
+                pass
+            # tx bitrate needs `iw`; refresh at most every 5 s
+            if net and time.monotonic() - self._wifi_rate[1] > 5.0:
+                self._wifi_rate[1] = time.monotonic()
+                try:
+                    out = subprocess.run(
+                        ["iw", "dev", self.wifi_if, "link"],
+                        capture_output=True, text=True, timeout=1.5).stdout
+                    for ln in out.splitlines():
+                        if "tx bitrate:" in ln:
+                            self._wifi_rate[0] = float(ln.split()[2])
+                except Exception:
+                    pass
+            if net:
+                net["tx_mbps"] = self._wifi_rate[0]
+        return {"cpu_pct": round(cpu, 1), "temps": temps, "net": net,
                 "mem_used": mem.get("MemTotal", 0) - mem.get("MemAvailable", 0),
                 "mem_total": mem.get("MemTotal", 0)}
+
+
+# ---------------------------------------------------------- DMA readback
+class DmaReader:
+    """Readback with two paths and automatic fallback:
+
+    helper_resident  native/xdma_shm_reader stays alive across frames --
+                     vendor-exact device access (same open flags, aligned
+                     bounce buffer, same chunked read loop) minus the
+                     per-frame process spawn and file round-trip.
+                     Opt-in via --fast-dma; NOT yet validated on hardware.
+    vendor_subprocess  dma_from_device CLI per frame (the proven path,
+                     default). Any helper failure falls back here for the
+                     rest of the session and is reported in metrics.
+    """
+
+    def __init__(self, use_helper, dev=A.C2H_DEV):
+        self.path = "vendor_subprocess"
+        self.p = None
+        self.view = None
+        self._shm_path = None
+        if use_helper:
+            try:
+                self._start_helper(dev)
+            except Exception as e:
+                self.path = f"vendor_subprocess (helper: {e})"
+                self._kill_helper()
+
+    def _start_helper(self, dev):
+        import select
+        exe = os.path.join(HERE, "native", "xdma_shm_reader")
+        if not os.path.exists(exe):
+            raise RuntimeError("helper binary missing (make -C native)")
+        self._shm_path = f"/dev/shm/adc_helper_{os.getpid()}.buf"
+        # tmpfs + malloc are both lazy: sizing for the full 500 MB window
+        # costs nothing until pages are actually touched
+        self.max_bytes = A.WR_WINDOW_BYTES
+        self.p = subprocess.Popen([exe, dev, self._shm_path,
+                                   str(self.max_bytes)],
+                                  stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True)
+        r, _, _ = select.select([self.p.stdout], [], [], 3.0)
+        banner = self.p.stdout.readline() if r else ""
+        if not banner.startswith("READY"):
+            raise RuntimeError(f"helper did not come up ({banner.strip()!r})")
+        import mmap as _mmap
+        self._f = open(self._shm_path, "r+b")
+        self._mm = _mmap.mmap(self._f.fileno(), self.max_bytes)
+        self.view = np.frombuffer(self._mm, dtype=np.uint16)
+        self.path = "helper_resident"
+
+    def _kill_helper(self):
+        if self.p is not None:
+            try:
+                self.p.kill(); self.p.wait(timeout=2)
+            except Exception:
+                pass
+            self.p = None
+        self.view = None
+        for attr in ("_mm", "_f"):
+            try:
+                getattr(self, attr).close()
+            except Exception:
+                pass
+        if self._shm_path:
+            try:
+                os.unlink(self._shm_path)
+            except OSError:
+                pass
+
+    def read_into(self, out, nsamples, addr=0):
+        nbytes = nsamples * 2
+        if self.p is not None:
+            import select
+            deadline = max(1.0, nbytes / 50e6 + 1.5)
+            try:
+                self.p.stdin.write(f"R {addr} {nbytes}\n")
+                self.p.stdin.flush()
+                r, _, _ = select.select([self.p.stdout], [], [], deadline)
+                reply = self.p.stdout.readline().strip() if r else ""
+            except (BrokenPipeError, OSError):
+                reply = ""
+            if reply.startswith("OK"):
+                got = int(reply.split()[1]) // 2
+                np.copyto(out[:got], self.view[:got])
+                return got
+            # helper failed or stalled: kill it, permanent vendor fallback
+            self._kill_helper()
+            self.path = f"vendor_subprocess (helper failed: {reply or 'timeout'})"
+            raise A.DmaTimeout(
+                f"resident DMA helper failed ({reply or 'no reply within '
+                f'{deadline:.1f}s'}); fell back to vendor CLI for the rest "
+                f"of this session")
+        return A.ddr_read_into(out, nsamples, addr)
+
+    def close(self):
+        if self.p is not None:
+            try:
+                self.p.stdin.write("Q\n"); self.p.stdin.flush()
+                self.p.wait(timeout=2)
+            except Exception:
+                pass
+        self._kill_helper()
+
+
+class MockAdc:
+    """Synthetic stand-in with correct timing semantics (finish goes low on
+    arm, comes back after N*(speed+1)/fs). NEVER opens /dev/*. For UI and
+    server development when the FPGA is off."""
+
+    def __init__(self):
+        self._r = {A.REG_START: 0, A.REG_SPEED: 0, A.REG_CHANNEL: 1,
+                   A.REG_NSAMPLES: 0, A.REG_FINISH: 1}
+        self._t_done = 0.0
+
+    def wr(self, off, val):
+        prev = self._r.get(A.REG_START, 0)
+        self._r[off] = int(val)
+        if off == A.REG_NSAMPLES:
+            self._r[A.REG_FINISH] = 0
+        if off == A.REG_START and val == 1 and prev == 0:
+            expect = (self._r[A.REG_NSAMPLES] *
+                      (self._r[A.REG_SPEED] + 1) / A.BASE_CLOCK_HZ)
+            self._t_done = time.monotonic() + expect
+            self._r[A.REG_FINISH] = 0
+
+    def rd(self, off):
+        if off == A.REG_FINISH and time.monotonic() >= self._t_done:
+            self._r[A.REG_FINISH] = 1
+        return self._r.get(off, 0)
+
+    @property
+    def finished(self):
+        return bool(self.rd(A.REG_FINISH) & 1)
+
+    def regs(self):
+        return {n: self.rd(o) for n, o in (
+            ("start", A.REG_START), ("speed", A.REG_SPEED),
+            ("channel", A.REG_CHANNEL), ("nsamples", A.REG_NSAMPLES),
+            ("finish", A.REG_FINISH))}
+
+    def recover(self):
+        self._r[A.REG_FINISH] = 1
+        return True
+
+    def close(self):
+        pass
+
+
+class MockDma:
+    """Phase-continuous 25 MHz tone at -14 dBFS + noise, mimicking real data.
+
+    Reads the speed register from the paired MockAdc and drops samples like
+    the FPGA's decimator, so a divided rate shows the tone at the physically
+    correct (possibly aliased) frequency instead of a mock artifact."""
+    path = "mock_synth"
+    F0 = 25e6
+
+    def __init__(self, adc=None):
+        self._adc = adc
+        self._phase = 0
+        self._rng = np.random.default_rng(0)
+
+    def read_into(self, out, nsamples, addr=0):
+        step = (self._adc._r.get(A.REG_SPEED, 0) + 1) if self._adc else 1
+        t = self._phase + step * np.arange(nsamples, dtype=np.float64)
+        self._phase += step * nsamples
+        sig = (8192.0 + 1638.0 * np.sin(2 * np.pi * self.F0 / A.BASE_CLOCK_HZ * t)
+               + self._rng.normal(0, 6, nsamples))
+        out[:nsamples] = np.clip(sig, 0, 16383).astype(np.uint16)
+        return nsamples
+
+    def close(self):
+        pass
 
 
 # ------------------------------------------------------------ acquisition
 class Engine:
     def __init__(self, nsamples=1 << 20, channel=1, speed=0, nfft=8192,
-                 max_frames=64, trace_width=1024, avg=4, min_period=0.005):
+                 max_frames=64, trace_width=1024, avg=4, min_period=0.005,
+                 fast_dma=False, mock=False):
+        self.fast_dma = fast_dma
+        self.mock = mock
         self.cfg = dict(nsamples=nsamples, channel=channel, speed=speed,
-                        nfft=nfft, max_frames=max_frames, avg=avg)
+                        nfft=nfft, max_frames=max_frames, avg=avg,
+                        trace_samples=-1,     # -1: trace shows the whole record
+                                              # (explicit count still accepted)
+                        readback=-1)   # -1 auto, 0 full N, >0 explicit
         self.trace_width = trace_width
         self.min_period = min_period      # floor on loop period; leaves the
                                           # scheduler room for networking
         self.running = True
         self.lock = threading.Lock()
+        self.new_frame = threading.Condition(self.lock)
         self.frame = None
         self.err = None
         self.sysmon = SysMon()
@@ -121,10 +357,16 @@ class Engine:
         self.t_start = time.monotonic()
         self._acc = None
         self._acc_n = 0
+        self._acc_tag = None   # (fs, nfft, channel) the accumulator belongs to
 
     # ---- lifecycle
     def start(self):
-        self.adc = A.Adc()
+        if self.mock:
+            self.adc = MockAdc()
+            self.dma = MockDma(self.adc)
+        else:
+            self.adc = A.Adc()
+            self.dma = DmaReader(self.fast_dma)
         self.sp = gpu.Spectrum(self.cfg["nfft"],
                                max_samples=max(1 << 22, self.cfg["nsamples"]),
                                trace_width=self.trace_width)
@@ -139,7 +381,7 @@ class Engine:
         # inviting an impatient second Ctrl-C mid-shutdown. 20s comfortably
         # covers worst case plus Spectrum teardown of the largest buffers.
         self.th.join(timeout=20)
-        self.sp.close(); self.adc.close()
+        self.sp.close(); self.dma.close(); self.adc.close()
 
     def configure(self, **kw):
         trig = bool(kw.pop("trigger", False))
@@ -219,39 +461,77 @@ class Engine:
             time.sleep(1e-4)          # never busy-spin on MMIO reads
         t_cap = time.monotonic() - t0
 
+        # Physics check. The FSM cannot digitise N samples faster than N/fs,
+        # so a completion far short of that means Adc_Finish was still high
+        # from the previous run (it idles high — see NOTES.md) and we are
+        # about to read a buffer that was never filled. Flag it rather than
+        # publishing a plausible-looking spectrum built from stale DDR.
+        suspect = t_cap < 0.5 * expect
+
+        # Read back only what is actually consumed. The spectrum uses exactly
+        # max_frames*nfft samples and the trace is decimated to trace_width
+        # columns, so at large N the full transfer is almost entirely wasted:
+        # at N=262,144,000 the FFT consumes 1 MB of the 500 MB moved.
+        #   readback = -1  auto: read what the FFT needs (default)
+        #            =  0  full N
+        #            = >0  explicit sample count
+        # frames the record can actually supply caps the need: at nfft close
+        # to N, max_frames*nfft would otherwise demand (and DMA) far more
+        # than the FFT can consume
+        need = min(cfg["max_frames"], max(1, N // nfft)) * nfft
+        tr_req = cfg.get("trace_samples", -1)
+        trace_n = N if tr_req < 0 else min(max(256, tr_req), N)
+        rb = cfg.get("readback", -1)
+        want = max(need, trace_n, rb) if rb > 0 else (N if rb == 0
+                                                      else max(need, trace_n))
+        read_n = min(N, want)
+        g = A.SAMPLE_GRANULARITY
+        read_n = max(g, -(-read_n // g) * g)     # round UP to granularity
+        read_n = min(read_n, N)
+        trace_n = min(trace_n, read_n)
+
         # Readback via the vendor dma_from_device CLI (subprocess + tempfile) —
         # NOT gpu.FastC2H's raw os.readv(), which bisect_dma.py showed wedges
         # the SoC regardless of destination buffer type. See module docstring.
         t1 = time.monotonic()
-        nbytes = N * 2
-        d = A.ddr_read_samples(N)
-        n = len(d)
-        np.copyto(self.sp.stage[:n], d)
+        nbytes = read_n * 2
+        n = self.dma.read_into(self.sp.stage, read_n)
         self.sp.load(n * 2)
         got = n * 2
         t_dma = time.monotonic() - t1
 
         # CUDA
         t2 = time.monotonic()
-        spec = self.sp.process(N, max_frames=cfg["max_frames"])
+        spec = self.sp.process(read_n, max_frames=cfg["max_frames"],
+                               trace_n=trace_n)
         t_gpu_wall = time.monotonic() - t2
 
         # exponential spectrum averaging
         navg = max(1, cfg["avg"])
-        if self._acc is None or self._acc.shape != spec.shape:
-            self._acc = spec.astype(np.float64).copy(); self._acc_n = 1
+        # configure() resets the accumulator, but a frame produced under the
+        # OLD cfg can still land afterwards and re-seed it; spectra from
+        # different fs/nfft/channel share bin indices, so blending them shows
+        # stale peaks at wrong frequencies (seen: a 6.25 MHz peak from
+        # speed=7 displayed as 50 MHz after switching to speed=0). Tag the
+        # accumulator with the producing config and reseed on any mismatch.
+        tag = (fs := A.sample_rate(sp_), nfft, ch)
+        if (self._acc is None or self._acc.shape != spec.shape
+                or self._acc_tag != tag):
+            self._acc = spec.copy(); self._acc_n = 1
+            self._acc_tag = tag
+        elif navg == 1:
+            np.copyto(self._acc, spec); self._acc_n = 1
         else:
-            a = 1.0 / navg
-            self._acc = (1 - a) * self._acc + a * spec
+            a = np.float32(1.0 / navg)
+            self._acc *= (1 - a); self._acc += a * spec
             self._acc_n = min(self._acc_n + 1, navg)
-        shown = self._acc.astype(np.float32)
+        shown = self._acc
 
         t_loop = time.monotonic() - t_loop0
         self.tot_frames += 1
         self.tot_samples += N
         self.tot_bytes += nbytes
 
-        fs = A.sample_rate(sp_)
         st = self.sp.stats
         bin_hz = fs / nfft
         # Peak/noise stay full-resolution (cheap: an argmax/median over the
@@ -259,12 +539,11 @@ class Engine:
         k = int(np.argmax(shown[1:]) + 1)
         peak_f = k * fs / nfft
         peak_db = float(shown[k])
-        noise = float(np.median(shown))
+        step = max(1, (len(shown) - 1) // 16384)
+        noise = float(np.median(shown[1::step]))
         gt = self.sp.times
 
-        disp = decimate_max(shown, DISP_BINS)
-        disp_bin_hz = (len(shown) - 1) * bin_hz / max(1, len(disp) - 1) \
-            if len(disp) > 1 else bin_hz
+        disp, disp_f0, disp_f1 = log_display(shown, bin_hz, DISP_BINS)
 
         zoom_meta = {"active": False, "bins": 0, "lo_hz": 0.0, "hi_hz": 0.0, "bin_hz": 0.0}
         zoom_bytes = b""
@@ -288,7 +567,9 @@ class Engine:
             "fs_hz": fs,
             "nbins": int(self.sp.nbins),          # true FFT resolution
             "disp_bins": int(len(disp)),          # length of the array actually sent
-            "disp_bin_hz": disp_bin_hz,
+            "disp_log": True,                     # log-spaced from disp_f0 to disp_f1
+            "disp_f0": disp_f0,
+            "disp_f1": disp_f1,
             "zoom": zoom_meta,
             "trace_width": int(self.trace_width),
             "nframes": int(self.sp.nframes),
@@ -296,6 +577,12 @@ class Engine:
             "acq": {
                 "capture_ms": t_cap * 1e3,
                 "capture_theory_ms": expect * 1e3,
+                "capture_suspect": bool(suspect),
+                "capture_samples": N,
+                "read_samples": read_n,
+                "read_pct": 100.0 * read_n / N if N else 0.0,
+                "trace_samples": trace_n,
+                "fft_samples": min(need, read_n),
                 "dma_ms": t_dma * 1e3,
                 "dma_gbps": (nbytes / t_dma) / 1e9 if t_dma > 0 else 0,
                 "gpu_wall_ms": t_gpu_wall * 1e3,
@@ -305,7 +592,7 @@ class Engine:
                 "coverage_pct": 100.0 * (N / fs) / t_loop if t_loop > 0 else 0,
                 "eff_msps": (N / t_loop) / 1e6 if t_loop > 0 else 0,
                 "bytes_ok": got == nbytes,
-                "dma_path": "vendor_subprocess",
+                "dma_path": self.dma.path,
             },
             "gpu": {
                 "h2d_ms": float(gt[0]), "kern_ms": float(gt[1]),
@@ -337,8 +624,10 @@ class Engine:
         blob = (struct.pack("<I", len(hdr)) + hdr +
                 disp.tobytes() + zoom_bytes +
                 self.sp.tmin.tobytes() + self.sp.tmax.tobytes())
-        with self.lock:
+        with self.new_frame:
             self.frame = blob
+            self.new_frame.notify_all()   # wake every long-poll waiter
+        self.err = None       # a completed capture clears any stale error
 
 
 _memcache = [0, 0, 0.0]
@@ -379,8 +668,28 @@ class Handler(BaseHTTPRequestHandler):
                 b = b"<h1>web/index.html missing</h1>"
             return self._send(200, b, "text/html; charset=utf-8")
         if p == "/frame":
-            with self.engine.lock:
-                f = self.engine.frame
+            # Long-poll: /frame?wait=1&since=<frames-counter> parks the
+            # request until a frame newer than <since> exists (25 s cap,
+            # then 304). One round-trip per frame instead of a stream of
+            # /status polls -- far kinder to a lossy WiFi link.
+            q = {}
+            if "?" in self.path:
+                for kv in self.path.split("?", 1)[1].split("&"):
+                    k, _, v = kv.partition("=")
+                    q[k] = v
+            e = self.engine
+            if q.get("wait") == "1":
+                since = int(q.get("since", "0") or 0)
+                deadline = time.monotonic() + 25.0
+                with e.new_frame:
+                    while (e.tot_frames <= since or e.frame is None):
+                        left = deadline - time.monotonic()
+                        if left <= 0 or not e.new_frame.wait(timeout=left):
+                            return self._send(204, b"", "text/plain")
+                    f = e.frame
+                return self._send(200, f, "application/octet-stream")
+            with e.lock:
+                f = e.frame
             if f is None:
                 return self._send(503, b"no frame yet", "text/plain")
             return self._send(200, f, "application/octet-stream")
@@ -435,6 +744,101 @@ class Handler(BaseHTTPRequestHandler):
                               "application/json")
 
 
+LOCK_PATH = os.path.expanduser("~/.adc_capture.lock")
+
+
+class ReuseServer(ThreadingHTTPServer):
+    # SO_REUSEADDR: a stale TIME_WAIT socket from the previous run must never
+    # stop us rebinding. (It does NOT let two live servers share a port.)
+    allow_reuse_address = True
+    daemon_threads = True
+    # Nagle + delayed-ACK adds up to ~40 ms to each small reply; the UI polls
+    # /status every animation frame, so leaving it on made the whole page
+    # feel like it stuttered even when the engine was healthy.
+    disable_nagle_algorithm = True
+
+
+def acquire_single_instance(replace=False):
+    """Only one process may drive the AXI_CMD registers: two engines
+    interleaving triggers would corrupt each other's captures.
+
+    Returns (lockfile, None) on success, or (None, "pid port") if another
+    instance holds it."""
+    f = open(LOCK_PATH, "a+")
+    for attempt in range(2):
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f.seek(0); f.truncate()
+            return f, None
+        except OSError:
+            f.seek(0)
+            info = f.read().strip() or "?"
+            if not replace or attempt:
+                return None, info
+            pid = int(info.split()[0]) if info.split()[0].isdigit() else None
+            if pid:
+                print(f"--replace: stopping existing instance (pid {pid}) …")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                for _ in range(50):
+                    try:
+                        os.kill(pid, 0); time.sleep(0.1)
+                    except ProcessLookupError:
+                        break
+    return None, "?"
+
+
+def bind_server(bind, port, tries=20):
+    """Bind without ever dying on EADDRINUSE: walk forward from the requested
+    port, then fall back to a kernel-assigned one."""
+    if port == 0:
+        srv = ReuseServer((bind, 0), Handler)
+        return srv, srv.server_address[1]
+    first_err = None
+    for p in range(port, port + tries):
+        try:
+            return ReuseServer((bind, p), Handler), p
+        except OSError as e:
+            if e.errno not in (errno.EADDRINUSE, errno.EACCES):
+                raise
+            first_err = first_err or e
+            if p == port:
+                who = port_holder(p)
+                print(f"port {p} busy{f' ({who})' if who else ''} — trying "
+                      f"{p + 1}–{port + tries - 1}", file=sys.stderr)
+    srv = ReuseServer((bind, 0), Handler)          # kernel picks a free port
+    return srv, srv.server_address[1]
+
+
+def port_holder(port):
+    try:
+        out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True,
+                             timeout=2).stdout
+        for line in out.splitlines():
+            if f":{port} " in line and "users:" in line:
+                return line.split("users:")[1].strip().strip('()')
+    except Exception:
+        pass
+    return None
+
+
+def local_urls(port):
+    urls = []
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope",
+                              "global"], capture_output=True, text=True,
+                             timeout=2).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) > 3:
+                urls.append(f"http://{parts[3].split('/')[0]}:{port}/")
+    except Exception:
+        pass
+    return urls or [f"http://localhost:{port}/"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--port", type=int, default=8090)  # 8080 is taken
@@ -445,19 +849,58 @@ def main():
     ap.add_argument("--nfft", type=int, default=8192)
     ap.add_argument("--min-period", type=float, default=0.005,
                     help="floor on loop period in seconds (default 5 ms)")
+    ap.add_argument("--replace", action="store_true",
+                    help="stop an already-running instance and take over")
+    ap.add_argument("--fast-dma", action="store_true",
+                    help="use the resident DMA helper (native/xdma_shm_reader)"
+                         " instead of spawning dma_from_device per frame."
+                         " Validate on hardware with validate_fast_dma.py"
+                         " before trusting it")
+    ap.add_argument("--mock", action="store_true",
+                    help="no hardware: synthetic 25 MHz tone, never opens"
+                         " /dev/*. For UI/server development")
     a = ap.parse_args()
+
+    lock = None
+    if a.mock:
+        print("MOCK MODE - synthetic data, hardware untouched")
+    else:
+        lock, holder = acquire_single_instance(a.replace)
+    if lock is None and not a.mock:
+        pid, _, oport = holder.partition(" ")
+        print(f"\nAlready running (pid {pid})"
+              + (f" on port {oport}" if oport else "") + ".", file=sys.stderr)
+        if oport.isdigit():
+            for u in local_urls(int(oport)):
+                print(f"  {u}", file=sys.stderr)
+        print("\nThat instance already owns the FPGA. Use it, or restart with:"
+              "\n  python3 server.py --replace\n", file=sys.stderr)
+        return 1
+
     eng = Engine(nsamples=a.nsamples, channel=a.channel, nfft=a.nfft,
-                 min_period=a.min_period)
+                 min_period=a.min_period, fast_dma=a.fast_dma, mock=a.mock)
     eng.start()
     Handler.engine = eng
-    srv = ThreadingHTTPServer((a.bind, a.port), Handler)
-    print(f"serving on http://{a.bind}:{a.port}/  (ctrl-C to stop)")
+    srv, port = bind_server(a.bind, a.port)
+    if lock:
+        lock.write(f"{os.getpid()} {port}\n"); lock.flush()
+
+    print(f"serving on port {port}  (ctrl-C to stop)")
+    for u in local_urls(port):
+        print(f"  {u}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        srv.server_close()
         eng.stop()
+        if lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+                os.unlink(LOCK_PATH)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

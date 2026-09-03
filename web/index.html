@@ -90,6 +90,7 @@ tr:last-child td{border-bottom:0}
   <span class="badge" id="stFps">– fps</span>
   <span class="badge" id="stSrc">–</span>
   <span class="badge" id="stCov">–</span>
+  <span class="badge" id="stNet" title="Orin WiFi link (RSSI · TX rate) and network lag: how much later each frame arrives at this browser than the engine produced it. The long-poll transport self-adapts: on a slow link you get the newest frame at whatever rate the link sustains — no backlog builds up.">net –</span>
 </header>
 
 <div class="tabs">
@@ -132,8 +133,10 @@ tr:last-child td{border-bottom:0}
           <select id="speed"></select>
           <label>FFT size</label>
           <select id="nfft"></select>
-          <label>Avg depth</label>
-          <select id="avg"></select>
+          <label>FFT frames</label>
+          <select id="max_frames" title="Welch segments averaged inside every capture. 1 = a true single FFT per capture (fluctuating noise floor); higher = smoother floor. This was hard-wired to 64 before, which is why the spectrum looked averaged even with the EMA off."></select>
+          <label>Trace avg</label>
+          <select id="avg" title="Exponential average ACROSS captures (display smoothing). 1 = off"></select>
           <div class="btn">
             <button class="pri" id="bRun">▶ Run</button>
             <button id="bSingle">⚡ Single</button>
@@ -173,6 +176,9 @@ const si=b=>{const u=['B','KB','MB','GB','TB'];let i=0;b=b||0;
 const eng=(h)=>{if(!isFinite(h))return '–';
   if(h>=1e6)return (h/1e6).toFixed(4)+' MHz';
   if(h>=1e3)return (h/1e3).toFixed(3)+' kHz';return h.toFixed(1)+' Hz'};
+const axTimeUnit=spanS=>spanS>=1?[1,'s']:spanS>=1e-3?[1e3,'ms']
+  :spanS>=1e-6?[1e6,'µs']:[1e9,'ns'];
+const axNum=v=>v>=100?v.toFixed(0):v>=10?v.toFixed(1):v.toFixed(2);
 const axFreq=v=>{if(!isFinite(v))return '–';
   if(v>=1e6)return (v/1e6).toFixed(v>=1e7?0:1)+'M';
   if(v>=1e3)return (v/1e3).toFixed(v>=1e4?0:1)+'k';return v.toFixed(0)};
@@ -195,6 +201,9 @@ const opts=(el,vals,fmt,sel)=>{el.innerHTML=vals.map(v=>
 const NSAMPLE_BASE=[4096,16384,65536,262144,1048576,4194304,16777216,67108864];
 let MAX_SAMPLES=262144000;
 const pow2Floor=n=>Math.pow(2,Math.floor(Math.log2(Math.max(1,n))));
+let autoNfft=true;                       // default: FFT length follows Samples
+const NFFT_AUTO_CAP=1<<27;   // 134M-pt validated on this GPU: 116 ms, ~1 GB
+const effAutoNfft=()=>pow2Floor(Math.min(+$('nsamples').value||1048576,NFFT_AUTO_CAP));
 // FFT size can be at most the sample count (nfft > nsamples yields 0 frames
 // and errors) -- so its range is rebuilt every time nsamples changes,
 // capped overall at the largest power of two the true hardware max allows.
@@ -204,16 +213,23 @@ function buildNfftOpts(capSamples){
   const vals=[];
   for(let v=1024;v<=top;v*=2)vals.push(v);
   if(!vals.length)vals.push(1024);
-  const cur=+$('nfft').value||8192;
-  const sel=vals.includes(cur)?cur:vals[vals.length-1];
-  opts($('nfft'),vals,v=>v.toLocaleString()+(v===hardCeil?' — MAX':''),sel);
+  const curRaw=$('nfft').value, cur=+curRaw||8192;
+  const sel=(autoNfft||curRaw==='auto'||curRaw==='')?'auto'
+            :(vals.includes(cur)?cur:vals[vals.length-1]);
+  $('nfft').innerHTML=['<option value="auto"'+(sel==='auto'?' selected':'')
+      +'>auto — follow samples</option>']
+    .concat(vals.map(v=>`<option value="${v}"${v===sel?' selected':''}>`
+      +v.toLocaleString()+(v===hardCeil?' — MAX':'')+'</option>')).join('');
 }
 function buildNsampleOpts(maxSamples){
   MAX_SAMPLES=maxSamples;
   let vals=NSAMPLE_BASE.filter(v=>v<=maxSamples);
   if(!vals.includes(maxSamples))vals.push(maxSamples);
+  const fs=250e6/((+($('speed')&&$('speed').value)||0)+1);
+  const cur=+$('nsamples').value||1048576;
   opts($('nsamples'),vals,
-       v=>v.toLocaleString()+' ('+si(v*2)+')'+(v===maxSamples?' — MAX':''),1048576);
+       v=>v.toLocaleString()+' · '+fmtDur(v/fs)+(v===maxSamples?' — MAX':''),
+       vals.includes(cur)?cur:1048576);
   buildNfftOpts(+$('nsamples').value);
 }
 buildNsampleOpts(MAX_SAMPLES); // sane default before /limits answers
@@ -222,10 +238,12 @@ fetch('/limits',{cache:'no-store'}).then(r=>r.json()).then(lim=>{
 }).catch(()=>{});
 opts($('speed'),[0,1,3,7,15,31,63,255],
      v=>`${v} — ${(250/(v+1)).toFixed(3)} Msps`,0);
-opts($('avg'),[1,2,4,8,16,32],v=>v==1?'1 (off)':v,4);
+opts($('avg'),[1,2,4,8,16,32],v=>v==1?'1 (off)':v+'\u00d7 EMA',4);
+opts($('max_frames'),[1,2,4,8,16,32,64,128,256],v=>v==1?'1 (single FFT)':v+'\u00d7 Welch',64);
+function fmtDur(sec){const [k,u]=axTimeUnit(sec);return axNum(sec*k)+' '+u}
 
 // ---- pending/applied confirmation for control changes
-const CTL_IDS=['channel','nsamples','speed','nfft','avg'];
+const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames'];
 const pending={};
 function markPending(id){
   pending[id]=$(id).value;
@@ -241,19 +259,44 @@ function checkApplied(m){
     }
   });
 }
+function sendNfft(eff){
+  pending['nfft']=String(eff);
+  $('nfft').classList.add('pending');$('nfft').classList.remove('applied');
+  fBounds=null;send({nfft:eff});
+}
 CTL_IDS.forEach(id=>$(id).addEventListener('change',()=>{
-  markPending(id);send({[id]:+$(id).value});
+  const raw=$(id).value;
+  if(id==='nfft'){
+    autoNfft=(raw==='auto');
+    sendNfft(autoNfft?effAutoNfft():+raw);
+    return;
+  }
+  markPending(id);send({[id]:+raw});
+  if(id==='speed'){buildNsampleOpts(MAX_SAMPLES)}
   if(id==='nsamples'){
-    const prevNfft=+$('nfft').value;
-    buildNfftOpts(+$('nsamples').value);   // nfft can be at most nsamples
-    const newNfft=+$('nfft').value;
-    if(newNfft!==prevNfft){markPending('nfft');send({nfft:newNfft})}
+    const prevRaw=$('nfft').value;
+    buildNfftOpts(+raw);                   // manual nfft is capped at nsamples
+    if(autoNfft){sendNfft(effAutoNfft())}  // FFT follows the record length
+    else if($('nfft').value!==prevRaw){sendNfft(+$('nfft').value)}
   }
 }));
+// align the server (which boots at nfft=8192) with the auto default.
+// Deferred: sendNfft touches fBounds, whose `let` further down has not run
+// yet at this point in script evaluation (TDZ).
+setTimeout(()=>sendNfft(effAutoNfft()),0);
 
 // ---- canvas helpers
+// Reassigning canvas.width/height reallocates + clears the whole backing
+// store; doing that every frame on two canvases was measurable jank. Only
+// touch it when the CSS size or devicePixelRatio actually changed.
+const _cvState=new WeakMap();
 function setup(cv){const d=window.devicePixelRatio||1,r=cv.getBoundingClientRect();
-  cv.width=r.width*d;cv.height=r.height*d;const c=cv.getContext('2d');
+  const st=_cvState.get(cv);
+  if(!st||st.w!==r.width||st.h!==r.height||st.d!==d){
+    cv.width=r.width*d;cv.height=r.height*d;
+    _cvState.set(cv,{w:r.width,h:r.height,d});
+  }
+  const c=cv.getContext('2d');
   c.setTransform(d,0,0,d,0,0);return {c,w:r.width,h:r.height}}
 const PAD={l:52,r:10,t:10,b:22};
 function axes(c,w,h,xt,yt,xl,yl){
@@ -292,8 +335,9 @@ function drawTime(m,tmin,tmax){
   if(!isFinite(lo)){lo=0;hi=16383}
   const pad=Math.max(4,(hi-lo)*0.08);lo-=pad;hi+=pad;
   tBounds=ema(tBounds,lo,hi,0.3);lo=tBounds.lo;hi=tBounds.hi;
-  const dur_s=m.cfg.nsamples/m.fs_hz;
-  const xt=[0,.25,.5,.75,1].map(p=>({p,l:(dur_s*p*1e6).toFixed(1)+'µs'}));
+  const dur_s=(m.acq.trace_samples||m.acq.read_samples||m.cfg.nsamples)/m.fs_hz;
+  const [tk,tu]=axTimeUnit(dur_s);
+  const xt=[0,.25,.5,.75,1].map(p=>({p,l:axNum(dur_s*p*tk)+tu}));
   const yt=[0,.25,.5,.75,1].map(p=>({p,l:Math.round(lo+(hi-lo)*p)}));
   const g=axes(c,w,h,xt,yt);
   const Y=v=>g.y0+g.ph*(1-(v-lo)/(hi-lo));
@@ -306,7 +350,7 @@ function drawTime(m,tmin,tmax){
   c.beginPath();
   for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1),y=Y((tmin[i]+tmax[i])/2);i?c.lineTo(x,y):c.moveTo(x,y)}
   c.stroke();
-  $('tdInfo').textContent=`${m.cfg.nsamples.toLocaleString()} pts · ${(dur_s*1e6).toFixed(2)} µs · envelope ${n} cols · autoscaled`;
+  $('tdInfo').textContent=`${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu} · envelope ${n} cols`;
 }
 
 // Spectrum: log frequency (x) × dB (y, already log-magnitude) = log-log for
@@ -324,14 +368,16 @@ function drawFreq(m,dispSpec,zoomSpec){
   const zoomed=!!(m.zoom&&m.zoom.active&&zoomSpec&&zoomSpec.length>1);
   const spec=zoomed?zoomSpec:dispSpec;
   const n=spec.length;
-  const binHz=zoomed?m.zoom.bin_hz:m.disp_bin_hz;
-  const base=zoomed?m.zoom.lo_hz:0;          // spec[i] covers [base+i*binHz, base+(i+1)*binHz)
-  const fLo=zoomed?Math.max(m.zoom.lo_hz,1e-6):Math.max(binHz,1);
-  const fHi=zoomed?m.zoom.hi_hz:fmax;
+  const binHz=zoomed?m.zoom.bin_hz:m.bin_hz;
+  const base=zoomed?m.zoom.lo_hz:0;
+  // overview: log-spaced points from the true first bin to Nyquist, so a
+  // longer record visibly extends the axis downward (31 kHz floor is gone)
+  const fLo=zoomed?Math.max(m.zoom.lo_hz,1e-6):Math.max(m.disp_f0||m.bin_hz,1e-3);
+  const fHi=zoomed?m.zoom.hi_hz:(m.disp_f1||fmax);
   const useLog=!zoomed;
 
   let lo=Infinity,hi=-Infinity;
-  for(let i=(zoomed?0:1);i<n;i++){const v=spec[i];if(v<lo)lo=v;if(v>hi)hi=v} // overview skips DC bin
+  for(let i=0;i<n;i++){const v=spec[i];if(v<lo)lo=v;if(v>hi)hi=v} // overview already excludes DC
   if(!isFinite(lo)){lo=-120;hi=0}
   const span=Math.max(10,hi-lo);
   lo-=span*0.08;hi+=span*0.18; // extra headroom above so the peak label fits
@@ -352,13 +398,19 @@ function drawFreq(m,dispSpec,zoomSpec){
 
   const pxN=Math.max(1,Math.floor(g.pw));
   const pts=new Array(pxN);
-  const i0min=zoomed?0:1;
   for(let px=0;px<pxN;px++){
-    const f0=fromP(px/pxN),f1=fromP((px+1)/pxN);
-    let i0=Math.max(i0min,Math.round((f0-base)/binHz)),i1=Math.min(n-1,Math.max(i0,Math.round((f1-base)/binHz)));
+    let i0,i1;
+    if(zoomed){       // linear full-res slice: map pixel->freq->bin index
+      const f0=fromP(px/pxN),f1=fromP((px+1)/pxN);
+      i0=Math.max(0,Math.round((f0-base)/binHz));
+      i1=Math.min(n-1,Math.max(i0,Math.round((f1-base)/binHz)));
+    }else{            // log-spaced points are uniform along the log axis
+      i0=Math.floor(n*px/pxN);
+      i1=Math.min(n-1,Math.max(i0,Math.floor(n*(px+1)/pxN)-1));
+    }
     let v=-1e9;
     for(let j=i0;j<=i1;j++) if(spec[j]>v) v=spec[j];
-    pts[px]=(v===-1e9)?spec[Math.min(n-1,Math.max(i0min,i0))]:v;
+    pts[px]=(v===-1e9)?spec[Math.min(n-1,Math.max(0,i0))]:v;
   }
   const grad=c.createLinearGradient(0,g.y0,0,g.y0+g.ph);
   grad.addColorStop(0,'rgba(53,214,195,.35)');grad.addColorStop(1,'rgba(53,214,195,0)');
@@ -378,7 +430,7 @@ function drawFreq(m,dispSpec,zoomSpec){
     c.fillText(`${eng(m.sig.peak_hz)}  ${f(m.sig.peak_db,1)} dBFS`,x+(x>w*.7?-6:6),g.y0+12)}
   $('fdInfo').textContent=zoomed
     ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · linear`
-    :`${m.nframes}× ${m.cfg.nfft}-pt · ${n.toLocaleString()} shown · ${eng(binHz)}/px · Hann · log/log`;
+    :`${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
   $('bZoomReset').style.display=zoomed?'':'none';
 }
 
@@ -407,10 +459,15 @@ function render(m,dispSpec,zoomSpec,tmin,tmax){
   const a=m.acq,g=m.gpu,s=m.sig,y=m.sys,t=m.totals;
   const cov=a.coverage_pct;
   fill($('tAcq'),[
-    ['capture','<b>'+f(a.capture_ms,3)+'</b> ms'],
-    ['↳ theoretical',f(a.capture_theory_ms,3)+' ms'],
+    ['capture','<b>'+f(a.capture_ms,3)+'</b> ms',a.capture_suspect?'v-bad':''],
+    ['↳ theoretical',f(a.capture_theory_ms,3)+' ms',a.capture_suspect?'v-bad':''],
+    ...(a.capture_suspect?[['⚠ capture','IMPOSSIBLY FAST','v-bad']]:[]),
+    ['read back',(a.read_samples||0).toLocaleString()+' ('+f(a.read_pct,1)+'%)',
+       a.read_pct<100?'v-warn':''],
     ['DMA readback',f(a.dma_ms,3)+' ms'],
     ['DMA bandwidth',f(a.dma_gbps,2)+' GB/s',a.dma_gbps>0.15?'v-good':'v-warn'],
+    ['DMA path',(a.dma_path||'').split(' ')[0],
+       (a.dma_path||'').includes('failed')?'v-bad':''],
     ['GPU (wall)',f(a.gpu_wall_ms,3)+' ms'],
     ['loop total','<b>'+f(a.loop_ms,3)+'</b> ms'],
     ['frame rate','<b>'+f(a.fps,1)+'</b> /s'],
@@ -452,6 +509,19 @@ function render(m,dispSpec,zoomSpec,tmin,tmax){
     ...tmp,
   ]);
   $('stFps').textContent=m.engine.running?f(a.fps,1)+' fps':'single-shot';
+  {
+    const nn=(y||{}).net;
+    let txt='net: wired/local';
+    if(nn&&isFinite(nn.rssi_dbm)){
+      const r=nn.rssi_dbm;
+      const bars=r>=-55?'▂▄▆█':r>=-65?'▂▄▆':r>=-72?'▂▄':r>=-80?'▂':'·';
+      txt=`${bars} ${f(r,0)} dBm`+(nn.tx_mbps?` · ${f(nn.tx_mbps,0)} Mb/s`:'');
+    }
+    if(netLag>5)txt+=` · lag ${f(netLag,0)} ms`;
+    const bad=(nn&&nn.rssi_dbm<-80)||netLag>400, warn=(nn&&nn.rssi_dbm<-70)||netLag>150;
+    $('stNet').textContent=txt;
+    $('stNet').className='badge '+(bad?'err':warn?'off':'on');
+  }
   $('stCov').textContent=f(cov,1)+'% coverage';
   $('stCov').className='badge '+(cov>50?'on':'off');
   $('stSrc').textContent=(s.is_test_ramp?'TEST RAMP (not ADC) · ':'ADC ch '+m.cfg.channel+' · ')+m.cfg.nsamples.toLocaleString()+' pts';
@@ -484,46 +554,58 @@ setInterval(()=>{
     : `frame #${lastM.totals.frames.toLocaleString()} · ${ago((Date.now()-lastCaptureWall)/1000)}`;
 },200);
 
+// Long-poll: ONE request per frame -- the server parks it until a frame
+// newer than `since` exists (204 after ~25 s of nothing). Compared with the
+// old status-poll-per-animation-frame this cuts the request rate ~10x and,
+// on a lossy WiFi link, turns "a burst of delayed polls" into "one delayed
+// frame", which is the difference between stutter and a barely-visible skip.
+let netLag=0;   // EWMA ms: frame arrival delay beyond engine production time
 async function poll(){
   while(true){
     try{
-      const sres=await fetch('/status',{cache:'no-store'});
-      const s=await sres.json();
-      if(lastFrames<0)lastFrames=s.frames;
-      updateEngineState(s);
-      // No fixed timeout: a max-size capture can legitimately take seconds.
-      // Only clear "capturing" on a real new frame, a reported error, or an
-      // extreme fallback so the button can never get stuck forever.
-      if(singlePending && (s.frames>singleBaseline || s.err || performance.now()-singleT0>30000)){
-        singlePending=false;$('bSingle').disabled=false;$('bSingle').textContent='⚡ Single';
-      }
-      if(s.has_frame && s.frames!==lastFrames){
-        lastFrames=s.frames;
-        const r=await fetch('/frame',{cache:'no-store'});
-        if(r.ok){
-          const buf=await r.arrayBuffer();
-          const dv=new DataView(buf);const hl=dv.getUint32(0,true);
-          const m=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,4,hl)));
-          let off=4+hl;
-          const dispSpec=new Float32Array(buf.slice(off,off+m.disp_bins*4));off+=m.disp_bins*4;
-          let zoomSpec=null;
-          if(m.zoom&&m.zoom.active&&m.zoom.bins>0){
-            zoomSpec=new Float32Array(buf.slice(off,off+m.zoom.bins*4));off+=m.zoom.bins*4;
-          }
-          const tw=m.trace_width;
-          const tmin=new Float32Array(buf.slice(off,off+tw*4));off+=tw*4;
-          const tmax=new Float32Array(buf.slice(off,off+tw*4));
-          lastM=m;lastCaptureWall=Date.now();
-          render(m,dispSpec,zoomSpec,tmin,tmax);
-          flashDot();
+      const t0=performance.now();
+      const r=await fetch('/frame?wait=1&since='+(lastFrames<0?0:lastFrames),
+                          {cache:'no-store'});
+      if(r.status===200){
+        const buf=await r.arrayBuffer();
+        const dv=new DataView(buf);const hl=dv.getUint32(0,true);
+        const m=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,4,hl)));
+        let off=4+hl;
+        const dispSpec=new Float32Array(buf.slice(off,off+m.disp_bins*4));off+=m.disp_bins*4;
+        let zoomSpec=null;
+        if(m.zoom&&m.zoom.active&&m.zoom.bins>0){
+          zoomSpec=new Float32Array(buf.slice(off,off+m.zoom.bins*4));off+=m.zoom.bins*4;
         }
+        const tw=m.trace_width;
+        const tmin=new Float32Array(buf.slice(off,off+tw*4));off+=tw*4;
+        const tmax=new Float32Array(buf.slice(off,off+tw*4));
+        const lag=Math.max(0,(performance.now()-t0)-m.acq.loop_ms);
+        netLag=netLag?netLag*0.75+lag*0.25:lag;
+        lastFrames=m.totals.frames;
+        lastM=m;lastCaptureWall=Date.now();
+        updateEngineState({running:m.engine.running,err:m.err,frames:lastFrames});
+        if(singlePending && (lastFrames>singleBaseline)){
+          singlePending=false;$('bSingle').disabled=false;$('bSingle').textContent='⚡ Single';
+        }
+        render(m,dispSpec,zoomSpec,tmin,tmax);
+        flashDot();
+      }else if(r.status===204||r.status===503){
+        // nothing new inside the window (paused engine, or an error is
+        // stopping captures): one cheap status check keeps badges honest
+        const s=await (await fetch('/status',{cache:'no-store'})).json();
+        if(lastFrames<0)lastFrames=s.frames;
+        updateEngineState(s);
+        if(singlePending && (s.err || performance.now()-singleT0>30000)){
+          singlePending=false;$('bSingle').disabled=false;$('bSingle').textContent='⚡ Single';
+        }
+        if(r.status===503)await new Promise(rs=>setTimeout(rs,300));
       }
       $('st').textContent='live';$('st').className='badge on';
     }catch(e){
       $('st').textContent='disconnected';$('st').className='badge err';
-      await new Promise(r=>setTimeout(r,500));
+      await new Promise(rs=>setTimeout(rs,500));
     }
-    await new Promise(r=>requestAnimationFrame(r));
+    await new Promise(rs=>requestAnimationFrame(rs));
   }
 }
 
