@@ -605,3 +605,35 @@ not the code -- a naive fps A/B again showed a bogus 55% (the control run
 afterwards came back lower than the treatment), and a Welch threshold looked
 stuck at 11.40 dB because the frame still carried the PREVIOUS analysis.
 Both needed waiting for a fresh `sid` / interleaved sampling to see straight.
+
+## 20. Log axis for wide zooms; control sync; UI syntax gate, 2026-09-04
+
+**"Few peaks at 10-100 kHz in the overview, lots when zoomed -- is it
+correct?"** The overview is correct. Measured marker distribution:
+
+    band            bins available   markers
+    1-10   kHz                  37         3
+    10-100 kHz                 377         2
+    100 kHz-1 MHz            3,774        28
+    1-10   MHz              37,748       286
+    10-125 MHz             482,344     6,098
+
+33 of 6417 markers sit below 1 MHz -- there really is almost nothing there,
+and at 238.4 Hz bins a 4.19 ms record only reaches bin 42 by 10 kHz. What
+looked like "lots of peaks" on zoom was the 1-14 MHz content: the zoom
+spanned 10 kHz-14 MHz but was drawn on a LINEAR axis, giving the first
+decade 0.6% of the width. `useLog` now depends on the SPAN rather than on
+being zoomed (log whenever hi/lo >= 10 and lo > 0), which also fixes the
+"10k -> 2.7M" tick jump reported as a weird x scale.
+
+**Control desync.** The screenshot showed "Classify: off" beside a populated
+Noise sources card: on load the selects showed their own hardcoded defaults
+while the server kept whatever configuration it was already running. The
+panel now adopts the server's values from the first frame.
+
+**tests/test_ui.py added.** The UI is one 700-line inline <script> edited by
+string replacement; a syntax error takes the page down with no server-side
+symptom, and references to payload fields removed during the /noise split
+fail silently as `undefined`. The test node --check's the extracted script,
+greps for known-dead field references, verifies every `$('id')` exists in
+the markup, and checks each server-side control is wired.

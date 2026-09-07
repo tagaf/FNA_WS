@@ -395,7 +395,12 @@ function drawFreq(m,dispSpec,zoomSpec){
   // longer record visibly extends the axis downward (31 kHz floor is gone)
   const fLo=zoomed?Math.max(m.zoom.lo_hz,1e-6):Math.max(m.disp_f0||m.bin_hz,1e-3);
   const fHi=zoomed?m.zoom.hi_hz:(m.disp_f1||fmax);
-  const useLog=!zoomed;
+  // Log vs linear is about the SPAN, not about being zoomed. A zoom of
+  // 10 kHz-14 MHz is three decades: drawn linearly the first decade gets
+  // 0.6% of the width, so a sparse low end looks identical to an empty one
+  // and the tick labels jump 10k -> 2.7M. Use log whenever the band covers
+  // more than a decade and starts above DC.
+  const useLog=!zoomed||(fLo>0&&fHi/fLo>=10);
 
   let lo=Infinity,hi=-Infinity;
   for(let i=0;i<n;i++){const v=spec[i];if(v<lo)lo=v;if(v>hi)hi=v} // overview already excludes DC
@@ -450,7 +455,7 @@ function drawFreq(m,dispSpec,zoomSpec){
     c.textAlign=x>w*.7?'right':'left';c.font='10px ui-monospace,monospace';
     c.fillText(`${eng(m.sig.peak_hz)}  ${f(m.sig.peak_db,1)} dBFS`,x+(x>w*.7?-6:6),g.y0+12)}
   $('fdInfo').textContent=zoomed
-    ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · linear`
+    ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · ${useLog?'log':'linear'}`
     :`${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
   drawThreshold(m,g,Y,pxN);
   drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN);
@@ -638,7 +643,31 @@ function renderNoise(m){
     input, compare channels): <code>tools/emi_sweep.py</code>.`;
 }
 
+// On load the selects show their own defaults while the server keeps
+// whatever config it was already running -- so the panel could read
+// "Classify: off" next to a populated Noise sources card. Adopt the
+// server's values once, on the first frame.
+let ctlsSynced=false;
+function syncControlsFromServer(m){
+  if(ctlsSynced||!m||!m.cfg)return;
+  ctlsSynced=true;
+  buildNsampleOpts(MAX_SAMPLES);
+  CTL_IDS.forEach(id=>{
+    if(!(id in m.cfg))return;
+    const el=$(id), want=String(m.cfg[id]);
+    if(id==='nfft'){
+      // 'auto' is a client-side mode; keep it only if the server's nfft is
+      // what auto would have chosen
+      if(autoNfft&&+want===effAutoNfft()){el.value='auto';return}
+      autoNfft=false;buildNfftOpts(+$('nsamples').value||1048576);
+    }
+    if([...el.options].some(o=>o.value===want))el.value=want;
+  });
+  if($('nsamples').value)buildNfftOpts(+$('nsamples').value);
+}
+
 function render(m,dispSpec,zoomSpec,tmin,tmax){
+  syncControlsFromServer(m);
   drawTime(m,tmin,tmax);drawFreq(m,dispSpec,zoomSpec);drawBudget(m.acq);
   renderNoise(m);checkApplied(m);
   const a=m.acq,g=m.gpu,s=m.sig,y=m.sys,t=m.totals;
