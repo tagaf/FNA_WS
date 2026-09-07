@@ -498,3 +498,34 @@ Fixes:
   plot. It is now recomputed from the live levels each frame.
 * The card states that levels are true per-bin peaks while the zoomed-out
   curve is a max envelope, so the two are read correctly.
+
+## 17. Why most peaks were never marked, 2026-09-04
+
+Reported as "not all the peaks are found, many are not noted". Measured on
+live data: detection was finding **2454 peaks** while only 32 spurs plus
+capped family members reached the browser. Two independent causes.
+
+**1. Ranking by absolute level, not prominence.** `_shape_analysis` sorted
+spurs by dB and kept the top 32 -- and every one of those 32 landed in
+103-112 MHz, because that band's broad hump sits highest in absolute terms.
+Genuinely isolated lines everywhere else were dropped. Ranking is now by
+prominence above the local CFAR threshold, throughout: `detect_peaks`
+trimming, spur ordering, and family-member selection. A modest line standing
+clear of its neighbourhood is the more notable feature, and prominence is
+also what the eye responds to.
+
+**2. Wire caps sized for a per-frame payload.** Members were capped at 96
+(one live family had 283) and spurs at 32, because the frequency arrays rode
+in every frame. Since markers are now drawn at the polyline's own value
+(section 16), the client needs no per-frame levels at all -- only the card's
+`peak_db`. So the structure moved to a separate `GET /noise`, tagged with a
+structure id (`sid`) that the frame carries; the client refetches only when
+`sid` changes. Caps are now 12 families x 512 members and 600 spurs, and the
+per-frame header actually *shrank* (frequency arrays no longer ride it).
+`why` is a whole sentence that repeated across hundreds of spurs -- sent once
+per label as `why_by_label`.
+
+Also: near-duplicate detections within 3 bins (one broad peak with a dip)
+are collapsed, keeping the most prominent of each cluster. Spur markers are
+now drawn with size and opacity scaled by prominence, so density does not
+flatten into undifferentiated clutter.

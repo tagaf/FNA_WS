@@ -98,11 +98,21 @@ def _refine(spec_db, k):
 
 
 def detect_peaks(spec_db, floor_db, bin_hz, nframes=1, pfa=1e-6,
-                 f_offset=0.0, max_peaks=4000, exclude_dc_bins=2):
+                 f_offset=0.0, max_peaks=4000, exclude_dc_bins=2,
+                 min_sep_bins=3):
     """CFAR-detect local maxima. Returns a list of dicts sorted by frequency.
 
     Each peak: {bin, freq_hz, db, prominence_db, snr_db}. `f_offset` is the
     frequency of bin 0 (nonzero for a zoom slice).
+
+    Ranking when trimming to `max_peaks` is by PROMINENCE above the local
+    threshold, not absolute level. Absolute level just picks whichever band
+    sits highest -- on real data every retained peak came from one 103-112
+    MHz hump while genuinely isolated lines elsewhere were dropped. A modest
+    line standing clear of its neighbourhood is the more notable feature.
+
+    `min_sep_bins` collapses detections that are really one broad peak with a
+    dip in it, keeping the most prominent of each cluster.
     """
     spec_db = np.asarray(spec_db, dtype=np.float64)
     floor_db = np.asarray(floor_db, dtype=np.float64)
@@ -122,9 +132,25 @@ def detect_peaks(spec_db, floor_db, bin_hz, nframes=1, pfa=1e-6,
     idx = idx[keep]
     if idx.size == 0:
         return []
-    if idx.size > max_peaks:            # keep the strongest
-        idx = idx[np.argsort(spec_db[idx])[::-1][:max_peaks]]
-        idx.sort()
+    prom_all = spec_db[idx] - thr[idx]
+    if min_sep_bins > 1 and idx.size > 1:
+        keep_mask = np.ones(idx.size, dtype=bool)
+        last = -10 ** 9
+        last_i = -1
+        for i in range(idx.size):
+            if idx[i] - last < min_sep_bins:
+                if prom_all[i] > prom_all[last_i]:
+                    keep_mask[last_i] = False
+                    last, last_i = idx[i], i
+                else:
+                    keep_mask[i] = False
+            else:
+                last, last_i = idx[i], i
+        idx = idx[keep_mask]
+        prom_all = prom_all[keep_mask]
+    if idx.size > max_peaks:            # keep the most PROMINENT
+        sel = np.argsort(prom_all)[::-1][:max_peaks]
+        idx = np.sort(idx[sel])
     peaks = []
     for k in idx.tolist():
         d, db = _refine(spec_db, k)

@@ -374,6 +374,7 @@ class Engine:
         self._an_cv = threading.Condition(self._an_lock)
         self._an_req = None
         self._an_last = 0.0
+        self._sid = 0          # structure id: bumped per completed analysis
 
     # ---- lifecycle
     def start(self):
@@ -454,9 +455,12 @@ class Engine:
                 if slack > 0:
                     time.sleep(slack)
 
-    MAX_WIRE_FAMILIES = 8
-    MAX_WIRE_MEMBERS = 96
-    MAX_WIRE_SPURS = 32
+    # The structure (which frequencies belong to which family) is fetched
+    # separately via /noise and only when it changes, so these can be
+    # generous without bloating the per-frame payload.
+    MAX_WIRE_FAMILIES = 12
+    MAX_WIRE_MEMBERS = 512
+    MAX_WIRE_SPURS = 600
 
     def _analysis_loop(self):
         while not self._stop.is_set():
@@ -468,7 +472,9 @@ class Engine:
                 continue
             try:
                 spec, bin_hz, fs, K, nfft, ch = req
-                r = noise.analyse(spec, bin_hz, fs, nframes=K, pfa=self.pfa)
+                r = noise.analyse(spec, bin_hz, fs, nframes=K, pfa=self.pfa,
+                                  max_peaks=4000)
+                self._sid += 1
                 self.analysis = self._shape_analysis(r, fs, nfft, ch)
             except Exception as e:
                 self.analysis = {"error": f"{type(e).__name__}: {e}"}
@@ -519,12 +525,21 @@ class Engine:
             # shown could disagree with the plot by a couple of dB
             return dict(f, dbs=dbs, peak_db=(max(dbs) if dbs else f.get("peak_db")))
 
-        out = dict(an)
-        out["families"] = [fam_live(f) for f in an.get("families", [])]
-        out["spurs"] = [dict(sp, db=(levels([sp["freq_hz"]]) or [sp["db"]])[0])
-                        for sp in an.get("spurs", [])]
+        # Frequencies are the bulk of the payload and change only when the
+        # structure does, so they ride on /noise?sid=N instead of every
+        # frame. Dots are drawn at the polyline's own value, so the client
+        # needs no per-frame levels at all -- only the card's peak_db.
+        out = {k: an[k] for k in ("sid", "ts", "fs_hz", "channel", "floor_db",
+                                  "thr_db", "n_peaks", "n_spurs_total")
+               if k in an}
+        out["families"] = [{k: f[k] for k in
+                            ("id", "f0_hz", "label", "why", "n_members",
+                             "density", "significance") if k in f}
+                           | {"peak_db": (max(levels(f.get("freqs", [])))
+                                          if f.get("freqs") else f.get("peak_db"))}
+                           for f in an.get("families", [])]
         out["structure_nfft"] = an.get("nfft")
-        out["nfft"] = nfft          # levels are current: markers are in sync
+        out["nfft"] = nfft
         out["live"] = True
         return out
 
@@ -533,7 +548,10 @@ class Engine:
         of entries and would dwarf the spectrum payload itself."""
         fams = []
         for i, f in enumerate(r["families"][:self.MAX_WIRE_FAMILIES]):
-            mem = sorted(f["members"], key=lambda m: -m["db"])[:self.MAX_WIRE_MEMBERS]
+            # by prominence, not absolute level -- see noise.detect_peaks
+            mem = sorted(f["members"],
+                         key=lambda m: -m.get("prominence_db", m["db"]))
+            mem = mem[:self.MAX_WIRE_MEMBERS]
             fams.append({
                 "id": i,
                 "f0_hz": f["f0_hz"],
@@ -547,15 +565,24 @@ class Engine:
                 "dbs": [m["db"] for m in mem],
             })
         spurs = [p for p in r["peaks"] if p.get("label") not in (None, "family_member")]
-        spurs.sort(key=lambda p: -p["db"])
+        spurs.sort(key=lambda p: -p.get("prominence_db", p["db"]))
+        why_by_label = {}
+        for p in spurs:
+            why_by_label.setdefault(p.get("label", "?"), p.get("why", ""))
         return {
+            "sid": self._sid,
             "ts": time.time(), "fs_hz": fs, "nfft": nfft, "channel": ch,
             "floor_db": r["floor_db"],
             "thr_db": r["threshold_db_over_floor"],
             "n_peaks": r["n_peaks"],
+            "n_spurs_total": len(spurs),
             "families": fams,
+            # `why` is a whole sentence and repeats across hundreds of spurs;
+            # send it once per label instead
+            "why_by_label": why_by_label,
             "spurs": [{"freq_hz": p["freq_hz"], "db": p["db"],
-                       "label": p["label"], "why": p.get("why", "")}
+                       "prom": p.get("prominence_db", 0.0),
+                       "label": p["label"]}
                       for p in spurs[:self.MAX_WIRE_SPURS]],
         }
 
@@ -835,6 +862,26 @@ class Handler(BaseHTTPRequestHandler):
             if f is None:
                 return self._send(503, b"no frame yet", "text/plain")
             return self._send(200, f, "application/octet-stream")
+        if p == "/noise":
+            # Full structure (family member frequencies, spur list). Fetched
+            # by the client only when the frame's `sid` changes.
+            an = self.engine.analysis
+            if not an or an.get("error"):
+                return self._send(503, b'{"sid":0,"families":[],"spurs":[]}',
+                                  "application/json")
+            body = json.dumps({
+                "sid": an.get("sid", 0),
+                "fs_hz": an.get("fs_hz"), "channel": an.get("channel"),
+                "why_by_label": an.get("why_by_label", {}),
+                "families": [{"id": f["id"],
+                              "freqs": [round(x, 1) for x in f.get("freqs", [])]}
+                             for f in an.get("families", [])],
+                "spurs": [{"f": round(s["freq_hz"], 1),
+                           "p": round(s.get("prom", 0.0), 2),
+                           "l": s.get("label", "")}
+                          for s in an.get("spurs", [])],
+            }).encode()
+            return self._send(200, body, "application/json")
         if p == "/limits":
             return self._send(200, json.dumps({
                 "granularity": A.SAMPLE_GRANULARITY,
