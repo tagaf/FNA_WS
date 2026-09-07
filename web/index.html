@@ -128,6 +128,10 @@ tr:last-child td{border-bottom:0}
       <div class="card">
         <h2>Spectrum — log/log (CUDA cuFFT)
           <span>
+            <label class="chk" title="Persistence / density display, as on a real-time spectrum analyser. Every trace is accumulated into a frequency x amplitude histogram and coloured by how often each cell is hit, so rare transients stay visible and the steady noise floor separates from intermittent signals. Accumulated in the browser, so it costs no extra bandwidth.">
+              persist
+            </label>
+            <select id="persist" style="width:auto"></select>
             <button id="bZoomReset" style="display:none">⤢ Reset zoom</button>
             <em id="fdInfo">–</em>
           </span>
@@ -269,6 +273,8 @@ opts($('speed'),[0,1,3,7,15,31,63,255],
      v=>`${v} — ${(250/(v+1)).toFixed(3)} Msps`,0);
 opts($('avg'),[1,2,4,8,16,32],v=>v==1?'1 (off)':v+'\u00d7 EMA',4);
 opts($('classify'),[0,1],v=>v?'on — label noise sources':'off',0);
+opts($('persist'),[0,0.5,2,10,-1],
+     v=>({0:'off',0.5:'0.5 s',2:'2 s',10:'10 s','-1':'hold'})[v],0);
 opts($('pfa_exp'),[2,3,4,6,9],
      v=>({2:'1e-2 — most marks',3:'1e-3 — sensitive',4:'1e-4',
           6:'1e-6 — default',9:'1e-9 — strict'})[v],6);
@@ -346,7 +352,7 @@ function axes(c,w,h,xt,yt,xl,yl){
 }
 
 // ---- autoscale with light smoothing so bounds don't jump every frame
-let tBounds=null, fBounds=null;
+let tBounds=null, fBounds=null, fHold=null;
 // 14-bit unsigned, right-aligned: codes run 0..16383 (NOTES.md section 4)
 const ADC_MIN=0, ADC_MAX=16383;
 let tLock=false;                     // lock the time-domain Y to full scale
@@ -407,6 +413,91 @@ function drawTime(m,tmin,tmax,tmean){
 // 0 Hz. Per-pixel max-hold over the bin range each pixel covers either way,
 // so a peak never gets skipped whether a pixel spans many bins or a bin
 // spans many pixels.
+// ---- persistence / density display -------------------------------------
+// A real-time analyser builds a frequency x amplitude histogram over many
+// traces and colours each cell by hit rate, so a rare transient stays on
+// screen next to the steady noise floor instead of being averaged into it.
+// Accumulated client-side from the spectra already being sent: no extra
+// bandwidth, and it works identically in the zoomed view.
+let persistTau=0;                 // seconds; 0 = off, <0 = infinite hold
+let pHist=null,pW=0,pH=0,pKey='',pLast=0,pCanvas=null,pImg=null;
+
+function persistKey(m,fLo,fHi,lo,hi,w,h){
+  // the histogram is tied to an axis mapping; any change invalidates it
+  return [m.cfg.channel,m.cfg.nfft,Math.round(m.fs_hz),
+          fLo.toFixed(1),fHi.toFixed(1),lo.toFixed(1),hi.toFixed(1),w,h].join('|');
+}
+function persistEnsure(key,w,h){
+  if(pKey===key&&pHist&&pW===w&&pH===h)return false;
+  pKey=key;pW=w;pH=h;
+  pHist=new Float32Array(w*h);
+  pCanvas=document.createElement('canvas');pCanvas.width=w;pCanvas.height=h;
+  pImg=pCanvas.getContext('2d').createImageData(w,h);
+  pLast=performance.now();
+  return true;
+}
+// Cells saturate rather than counting without bound. Otherwise a steady
+// noise floor grows for as long as the display runs while a one-off
+// transient stays at 1, so the very events persistence exists to show fade
+// to invisible -- worst in hold mode, where the floor never decays.
+const P_CAP=64;
+// blue -> cyan -> green -> yellow -> red, the conventional density ramp,
+// precomputed: a per-cell function call over ~400k cells每 frame is not free
+const P_LUT=(()=>{
+  const L=new Uint8ClampedArray(256*4);
+  for(let i=0;i<256;i++){
+    const t=i/255;let r,g,b;
+    if(t<0.25){const u=t/0.25;r=0;g=90*u;b=60+150*u}
+    else if(t<0.5){const u=(t-0.25)/0.25;r=0;g=90+140*u;b=210-70*u}
+    else if(t<0.75){const u=(t-0.5)/0.25;r=200*u;g=230;b=140-140*u}
+    else{const u=(t-0.75)/0.25;r=200+55*u;g=230-140*u;b=0}
+    L[i*4]=r;L[i*4+1]=g;L[i*4+2]=b;
+    L[i*4+3]=30+225*Math.min(1,t*2.2);      // let the empty floor stay dark
+  }
+  return L;
+})();
+function persistDraw(c,g,pts,pxN,Y,m,fLo,fHi,lo,hi){
+  const w=Math.max(1,Math.round(g.pw)),h=Math.max(1,Math.round(g.ph));
+  const reset=persistEnsure(persistKey(m,fLo,fHi,lo,hi,w,h),w,h);
+  const now=performance.now();
+  const dt=Math.max(0,(now-pLast)/1000);pLast=now;
+  // time-based decay so the look does not change with frame rate
+  if(!reset&&persistTau>0){   // persistTau < 0 means hold: never decay
+    const k=Math.exp(-dt/persistTau);
+    if(k<0.999)for(let i=0;i<pHist.length;i++)pHist[i]*=k;
+  }
+  // accumulate this trace, joining consecutive samples so it reads as a line
+  const row=v=>{
+    const y=(1-(v-lo)/(hi-lo))*h;
+    return y<0?0:(y>=h?h-1:y|0);
+  };
+  let prev=null;
+  for(let px=0;px<pxN&&px<w;px++){
+    const v=pts[px];
+    if(v==null||!isFinite(v)){prev=null;continue}
+    const r1=row(v), r0=prev==null?r1:prev; prev=r1;
+    const a=Math.min(r0,r1), b=Math.max(r0,r1);
+    for(let r=a;r<=b;r++){const i=r*w+px;if(pHist[i]<P_CAP)pHist[i]+=1}
+  }
+  // normalise against a high quantile so one hot cell cannot wash it out
+  let mx=0;
+  for(let i=0;i<pHist.length;i++)if(pHist[i]>mx)mx=pHist[i];
+  if(mx<=0)return;
+  // gamma lifts sparse hits; precomputed against the running max so the
+  // mapping is one multiply and a table lookup per cell
+  const g255=new Uint16Array(P_CAP+1);
+  for(let v=0;v<=P_CAP;v++)g255[v]=Math.min(255,Math.round(255*Math.pow(v/mx,0.45)));
+  const d=pImg.data;
+  for(let i=0,px=0;i<pHist.length;i++,px+=4){
+    const v=pHist[i];
+    if(v<=0){d[px+3]=0;continue}
+    const c4=g255[v<=P_CAP?v|0:P_CAP]*4;
+    d[px]=P_LUT[c4];d[px+1]=P_LUT[c4+1];d[px+2]=P_LUT[c4+2];d[px+3]=P_LUT[c4+3];
+  }
+  pCanvas.getContext('2d').putImageData(pImg,0,0);
+  c.drawImage(pCanvas,g.x0,g.y0);
+}
+
 let freqAxis=null;   // latest {x0,pw,fromP} so drag-select can invert pixel->Hz
 function drawFreq(m,dispSpec,zoomSpec){
   const {c,w,h}=setup($('cFreq'));
@@ -432,7 +523,16 @@ function drawFreq(m,dispSpec,zoomSpec){
   if(!isFinite(lo)){lo=-120;hi=0}
   const span=Math.max(10,hi-lo);
   lo-=span*0.08;hi+=span*0.18; // extra headroom above so the peak label fits
-  fBounds=ema(fBounds,lo,hi,0.15);lo=fBounds.lo;hi=fBounds.hi;
+  fBounds=ema(fBounds,lo,hi,0.15);
+  // Persistence is tied to a fixed amplitude mapping: if the axis kept
+  // drifting under it the histogram would smear (and reset) every frame.
+  // Hold the range while it accumulates, re-snapping only on a real change,
+  // which is also how an analyser behaves with a set reference level.
+  if(persistTau!==0){
+    if(!fHold||Math.abs(fBounds.lo-fHold.lo)>6||Math.abs(fBounds.hi-fHold.hi)>6)
+      fHold={lo:fBounds.lo,hi:fBounds.hi};
+    lo=fHold.lo;hi=fHold.hi;
+  }else{fHold=null;lo=fBounds.lo;hi=fBounds.hi}
 
   const logLo=Math.log10(fLo),logHi=Math.log10(Math.max(fLo*1.0001,fHi));
   const toP=freq=>useLog?(Math.log10(Math.max(fLo,freq))-logLo)/(logHi-logLo):(freq-fLo)/(fHi-fLo);
@@ -463,14 +563,22 @@ function drawFreq(m,dispSpec,zoomSpec){
     for(let j=i0;j<=i1;j++) if(spec[j]>v) v=spec[j];
     pts[px]=(v===-1e9)?spec[Math.min(n-1,Math.max(0,i0))]:v;
   }
-  const grad=c.createLinearGradient(0,g.y0,0,g.y0+g.ph);
-  grad.addColorStop(0,'rgba(53,214,195,.35)');grad.addColorStop(1,'rgba(53,214,195,0)');
-  c.beginPath();c.moveTo(g.x0,g.y0+g.ph);
-  for(let px=0;px<pxN;px++)c.lineTo(g.x0+px,Y(pts[px]));
-  c.lineTo(g.x0+pxN,g.y0+g.ph);c.closePath();c.fillStyle=grad;c.fill();
-  c.beginPath();
-  for(let px=0;px<pxN;px++){const y=Y(pts[px]);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y)}
-  c.strokeStyle=zoomed?'#f0a35e':'#35d6c3';c.lineWidth=1;c.stroke();
+  if(persistTau!==0){
+    persistDraw(c,g,pts,pxN,Y,m,fLo,fHi,lo,hi);
+    // faint live trace over the density so "now" is still identifiable
+    c.beginPath();
+    for(let px=0;px<pxN;px++){const y=Y(pts[px]);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y)}
+    c.strokeStyle='rgba(230,245,255,.5)';c.lineWidth=1;c.stroke();
+  }else{
+    const grad=c.createLinearGradient(0,g.y0,0,g.y0+g.ph);
+    grad.addColorStop(0,'rgba(53,214,195,.35)');grad.addColorStop(1,'rgba(53,214,195,0)');
+    c.beginPath();c.moveTo(g.x0,g.y0+g.ph);
+    for(let px=0;px<pxN;px++)c.lineTo(g.x0+px,Y(pts[px]));
+    c.lineTo(g.x0+pxN,g.y0+g.ph);c.closePath();c.fillStyle=grad;c.fill();
+    c.beginPath();
+    for(let px=0;px<pxN;px++){const y=Y(pts[px]);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y)}
+    c.strokeStyle=zoomed?'#f0a35e':'#35d6c3';c.lineWidth=1;c.stroke();
+  }
   // peak marker
   if(m.sig.peak_hz>=fLo&&m.sig.peak_hz<=fHi){
     const x=Xf(m.sig.peak_hz),y=Y(m.sig.peak_db);
@@ -481,7 +589,7 @@ function drawFreq(m,dispSpec,zoomSpec){
     c.fillText(`${eng(m.sig.peak_hz)}  ${f(m.sig.peak_db,1)} dBFS`,x+(x>w*.7?-6:6),g.y0+12)}
   $('fdInfo').textContent=zoomed
     ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · ${useLog?'log':'linear'}`
-    :`${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
+    :`${persistTau?(persistTau<0?'HOLD · ':'PERSIST '+persistTau+'s · '):''}${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
   drawThreshold(m,g,Y,pxN);
   drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN);
   $('bZoomReset').style.display=zoomed?'':'none';
@@ -900,6 +1008,10 @@ $('bSingle').addEventListener('click',()=>{
   send({trigger:true});
 });
 $('tLock').addEventListener('change',e=>{tLock=e.target.checked});
+$('persist').addEventListener('change',e=>{
+  persistTau=+e.target.value;      // 0 off, -1 infinite hold
+  pKey='';fHold=null;              // force a clean accumulator and axis snap
+});
 $('bReset').addEventListener('click',()=>location.reload());
 $('bRestart').addEventListener('click',async()=>{
   if(!confirm('Restart the whole server process?\n\nThis drops the live feed for EVERYONE currently viewing this page, not just you, and the engine comes back with its default startup config rather than your current settings.\n\nContinue?'))return;

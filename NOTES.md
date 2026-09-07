@@ -739,3 +739,31 @@ acf lag1 -1.000 against -0.003 healthy.
 
 Still unresolved; needs a run with the input actually shorted, and
 ultimately a properly biased known signal.
+
+## 24. Persistence / density display, 2026-09-04
+
+Real-time-analyser style persistence added to the spectrum: every trace is
+accumulated into a frequency x amplitude histogram and coloured by hit rate,
+so a rare transient stays on screen beside the steady noise floor instead of
+being averaged into it. Control in the spectrum header: off / 0.5 s / 2 s /
+10 s / hold.
+
+Accumulated entirely in the browser from the spectra already being sent, so
+it costs no extra bandwidth -- which matters on a 7 Mbit/s link.
+
+Three details that mattered:
+* **Decay is time-based** (exp(-dt/tau)), not per-frame, so the look does
+  not change when the frame rate does.
+* **Cells saturate at 64 hits.** Without a cap a steady floor counts up for
+  as long as the display runs while a one-off transient stays at 1, so the
+  very events persistence exists to reveal fade to invisible -- worst in
+  hold mode, where nothing decays. Verified: after 100 s of running, a
+  single transient still renders at 15% brightness.
+* **The vertical axis is held** while persistence accumulates (re-snapping
+  only on a >6 dB change). The histogram is tied to an amplitude mapping; a
+  drifting autoscale would smear and continually reset it. This is also how
+  an analyser behaves with a set reference level.
+
+Cost measured in node at full plot size (1450x280 = 406k cells):
+0.49 ms accumulate+decay, 1.27 ms render with a precomputed colour LUT, so
+~1.8 ms/frame, about 5% of one core at 30 fps.
