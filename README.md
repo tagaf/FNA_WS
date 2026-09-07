@@ -110,7 +110,10 @@ the long-poll transport self-adapts to a slow link by delivering fewer,
 | `web/index.html` | browser UI (no external deps) |
 | `native/xdma_shm_reader.c` | resident DMA helper — vendor-exact device access minus per-frame spawn (opt-in, below) |
 | `validate_fast_dma.py` | hardware qualification for the helper — run once before `--fast-dma` |
+| `noise.py` | peak detection + noise classification: CFAR, sub-bin refinement, harmonic sieve, rule-based labels |
+| `tools/emi_sweep.py` | drives the server across channel/fs conditions, classifies, cross-references, saves JSON |
 | `tests/test_controls.py` | full control-matrix regression against `--mock` (no hardware needed) |
+| `tests/test_noise.py` | `noise.py` unit tests against synthetic spectra (no hardware) |
 | `deploy/adc-capture.service` | systemd unit |
 | `adc_capture.py` | standalone CLI capture → `.npy`/`.bin` |
 | `baselines/` | measured EMI baselines (JSON) |
@@ -155,6 +158,31 @@ python3 tests/test_controls.py     # spins up --mock on localhost; asserts
 Mock mode is a faithful stand-in (timing semantics, rate-divider aliasing,
 a 25 MHz tone) that never opens `/dev/*` — safe on machines without the
 FPGA, and how every change in §8–§12 was verified before touching hardware.
+
+## Noise classification
+
+`noise.py` turns a spectrum into labelled sources; `tools/emi_sweep.py`
+collects the evidence that makes labelling possible:
+
+```bash
+python3 tools/emi_sweep.py --band 3e5 2e7 --channels 1 2 --speeds 0 1 \
+    --label "input floating"
+```
+
+Detection is CFAR (threshold from a stated false-alarm probability given the
+Welch depth, not a fixed dB margin); peaks are refined to ~0.02 bin; a
+harmonic sieve groups them into families with chance-correction and a
+two-pass fundamental fit; rules label them (`switching_regulator`,
+`mains_harmonics`, `harmonic_distortion`, `sampling_artifact_fs_2`, ...).
+Results are saved to `baselines/` so runs can be diffed across
+interventions -- **the interventions are what actually classify**: changing
+fs separates aliases and sampling artifacts, comparing channels separates
+common board-level sources from per-channel pickup, and terminating the
+input separates radiated from conducted coupling. See NOTES.md §13 for the
+measured behaviour and the one open ambiguity.
+
+Use a low-sidelobe window (`blackman-harris`) for spur hunting; Hann's
+-31.5 dB sidelobes let a strong tone's skirt be detected as spurs.
 
 ## Known constraints (evidence in NOTES.md)
 

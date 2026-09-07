@@ -360,3 +360,56 @@ record). The time plot now always shows the WHOLE record: trace_samples
 default -1 = follow N (explicit counts still accepted over /control).
 The knob was compensating for auto-readback reading less than the record;
 with nfft following the record that readback happens anyway.
+
+## 13. Peak detection + noise classification (branch), 2026-09-04
+
+New `noise.py` (pure NumPy/SciPy, hardware-free, tested against synthetic
+spectra in `tests/test_noise.py`) and `tools/emi_sweep.py` (drives the live
+server across conditions and cross-references). Windows became selectable in
+`cuda/adcfft.cu` first, because Hann's -31.5 dB sidelobes make leakage skirts
+indistinguishable from spurs.
+
+**Windows** (harris 1978 coefficients; measured vs theory, all exact):
+ENBW 1.50/2.00/3.77/1.00 and scalloping 1.42/0.83/0.01/3.92 dB for
+Hann/Blackman-Harris/flat-top/rect. All four give identical on-bin amplitude,
+confirming per-window coherent-gain normalisation (`norm = 2/sum(w)`, was
+hard-coded 4/nfft for Hann). Near-sidelobe measurement at a half-bin offset:
+at +25 bins Hann is -91.5 dB while BH4 is -133.5 dB -- 42 dB less leakage,
+which is the difference between detecting spurs and detecting a skirt.
+
+**Detection** is CFAR, not a fixed dB margin. Welch-averaged power is
+Gamma(K, mean/K), so the threshold for a target Pfa is
+gammainccinv(K,Pfa)/K; verified K=1 -> 11.40 dB = -ln(Pfa), and measured
+false-alarm counts track the requested Pfa over 2^20 bins. The floor
+estimator corrects median->mean for Gamma(K,1/K) (~1.6 dB at K=1) -- without
+it the achieved Pfa is not the requested one. Sub-bin refinement is
+parabolic-on-dB (magnitude only: Welch averaging discards phase, so Candan/
+Jacobsen/Quinn are unavailable); measured error <=0.016 bin.
+
+**The harmonic sieve needed three defences against overfitting**, all found
+by testing rather than reasoning:
+1. Scoring every candidate BEFORE claiming peaks. Greedy largest-first let
+   2*f0 steal every even harmonic and split one comb into three families.
+2. Density measured over harmonics 1..h_max(observed), not to the band edge
+   -- otherwise 50 Hz mains scores 7/64 and is rejected, while a
+   half-fundamental impostor is still correctly penalised at ~0.5.
+3. Chance correction: with P peaks over bandwidth B a predicted harmonic
+   matches by luck with p ~ 2tP/B, so a denser predicted grid collects
+   accidental members. Score on excess-over-chance in sigma. Plus a two-pass
+   LS refit of f0 with tightened tolerance. On live data this cut 15
+   families to 6 and removed all near-duplicates.
+4. Family merging must bound the integer ratio (<=8): 497.6 kHz is exactly
+   9952 x 50 Hz, so an unbounded test folds the switcher into mains.
+
+**Live result**: the pipeline independently recovers the 497.6 kHz comb
+found by hand in section 12's investigation (density 0.90, 36 harmonics,
+-86 dBFS) AND a second switcher at **532.85 kHz** (density 0.91, 59
+harmonics) that the manual pass missed, common to both channels.
+
+**Open / known limitation**: cross-fs inference is ambiguous for wideband
+combs. At speed=1 the fitted fundamentals are exactly half those at speed=0.
+Two readings -- (a) harmonics above the new Nyquist fold back, adding lines
+so the sieve legitimately locks to f0/2, or (b) the disturbance is periodic
+in sample index rather than time. Not resolved; the tool now reports this as
+AMBIGUOUS rather than claiming either. The termination experiment is the
+unambiguous discriminator and is the next measurement to run.

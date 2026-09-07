@@ -20,15 +20,45 @@ struct FftCtx {
     float *d_tmin, *d_tmax;
     cufftComplex *d_c;
     int max_frames;
+    int win_type;
+    float win_sum, win_enbw;    // coherent gain and equiv. noise bandwidth (bins)
     cufftHandle plan;
     int plan_frames;
     cudaStream_t s;
     cudaEvent_t e0,e1,e2,e3,e4;
 };
 
-__global__ void k_hann(float*w,int n){
+// Cosine-sum windows: w[n] = sum_k (-1)^k a_k cos(2*pi*k*n/(N-1)).
+// Hann's -31.5 dB sidelobes let a strong tone's leakage skirt masquerade as
+// spurs, which is fatal for peak classification; Blackman-Harris trades
+// resolution for -92 dB sidelobes, flat-top trades both for +-0.01 dB
+// amplitude accuracy. Coefficients per harris, Proc. IEEE 66(1), 1978.
+#define WIN_HANN 0
+#define WIN_BH4  1
+#define WIN_FLAT 2
+#define WIN_RECT 3
+
+__constant__ float c_wcoef[5];
+__constant__ int   c_wterms;
+
+__global__ void k_window(float*w,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<n) w[i]=0.5f*(1.0f-cosf(2.0f*M_PI*i/(n-1)));
+    if(i>=n) return;
+    float x=2.0f*M_PI*i/(n-1), v=0.0f, sgn=1.0f;
+    for(int k=0;k<c_wterms;k++){ v+=sgn*c_wcoef[k]*cosf(k*x); sgn=-sgn; }
+    w[i]=v;
+}
+
+// host-side coefficient table + analytic sums (exact to O(1) in N)
+static int win_coeffs(int type,float*a){
+    switch(type){
+      case WIN_BH4:  a[0]=0.35875f;a[1]=0.48829f;a[2]=0.14128f;a[3]=0.01168f; return 4;
+      case WIN_FLAT: a[0]=0.21557895f;a[1]=0.41663158f;a[2]=0.277263158f;
+                     a[3]=0.083578947f;a[4]=0.006947368f; return 5;
+      case WIN_RECT: a[0]=1.0f; return 1;
+      case WIN_HANN:
+      default:       a[0]=0.5f;a[1]=0.5f; return 2;
+    }
 }
 
 // pass 1: partial sum / sumsq / min / max
@@ -95,6 +125,24 @@ __global__ void k_env(const unsigned short*x,int n,float*mn,float*mx,int tw){
 
 extern "C" {
 
+static int apply_window(FftCtx*c,int type){
+    float a[5]={0,0,0,0,0};
+    int nt=win_coeffs(type,a);
+    if(cudaMemcpyToSymbol(c_wcoef,a,sizeof(a))!=cudaSuccess) return -1;
+    if(cudaMemcpyToSymbol(c_wterms,&nt,sizeof(int))!=cudaSuccess) return -1;
+    k_window<<<(c->nfft+255)/256,256,0,c->s>>>(c->d_win,c->nfft);
+    if(cudaStreamSynchronize(c->s)!=cudaSuccess) return -1;
+    double s1=a[0], s2=a[0]*(double)a[0];
+    for(int k=1;k<nt;k++) s2+=0.5*a[k]*(double)a[k];
+    c->win_type=type;
+    c->win_sum=(float)(s1*c->nfft);                 // sum(w)
+    c->win_enbw=(float)(s2/(s1*s1));                // ENBW in bins
+    return 0;
+}
+
+extern "C" int adc_set_window(FftCtx*c,int type){ return apply_window(c,type); }
+extern "C" float adc_win_enbw(FftCtx*c){ return c->win_enbw; }
+
 FftCtx* adc_create(int nfft,int maxs,int tw){
     FftCtx*c=(FftCtx*)calloc(1,sizeof(FftCtx));
     c->nfft=nfft; c->maxs=maxs; c->tw=tw; c->nbins=nfft/2+1; c->plan_frames=0;
@@ -112,8 +160,7 @@ FftCtx* adc_create(int nfft,int maxs,int tw){
     CK(cudaStreamCreate(&c->s));
     CK(cudaEventCreate(&c->e0)); CK(cudaEventCreate(&c->e1)); CK(cudaEventCreate(&c->e2));
     CK(cudaEventCreate(&c->e3)); CK(cudaEventCreate(&c->e4));
-    k_hann<<<(nfft+255)/256,256,0,c->s>>>(c->d_win,nfft);
-    cudaStreamSynchronize(c->s);
+    if(apply_window(c,WIN_HANN)!=0) return NULL;
     return c;
 }
 
@@ -158,8 +205,9 @@ int adc_process(FftCtx*c,int nsamples,int max_frames,int trace_n,
     cudaEventRecord(c->e3,c->s);
 
     k_pow<<<(c->nbins+255)/256,256,0,c->s>>>(d_c,c->d_pow,c->nbins,frames);
-    // Hann coherent gain: sum(w) = nfft/2 ; amplitude = 2*|X|/sum(w)
-    k_db<<<(c->nbins+255)/256,256,0,c->s>>>(c->d_pow,c->d_spec,c->nbins,4.0f/nfft);
+    // amplitude = 2*|X|/sum(w) -- coherent gain depends on the window
+    k_db<<<(c->nbins+255)/256,256,0,c->s>>>(c->d_pow,c->d_spec,c->nbins,
+                                            2.0f/c->win_sum);
     cudaMemcpyAsync(spec,c->d_spec,(size_t)c->nbins*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmin,c->d_tmin,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmax,c->d_tmax,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);

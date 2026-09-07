@@ -54,6 +54,10 @@ _l.adc_process.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                            ctypes.c_int,
                            _F, _F, _F, _F, _F, ctypes.POINTER(ctypes.c_int)]
 _l.adc_process.restype = ctypes.c_int
+_l.adc_set_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_l.adc_set_window.restype = ctypes.c_int
+_l.adc_win_enbw.argtypes = [ctypes.c_void_p]
+_l.adc_win_enbw.restype = ctypes.c_float
 _l.adc_destroy.argtypes = [ctypes.c_void_p]
 _l.adc_meminfo.argtypes = [ctypes.POINTER(ctypes.c_size_t)]*2
 
@@ -62,6 +66,11 @@ def gpu_mem():
     f, t = ctypes.c_size_t(), ctypes.c_size_t()
     _l.adc_meminfo(ctypes.byref(f), ctypes.byref(t))
     return f.value, t.value
+
+
+# window ids must match the WIN_* defines in cuda/adcfft.cu
+WINDOWS = {"hann": 0, "blackman-harris": 1, "flattop": 2, "rect": 3}
+WINDOW_NAMES = {v: k for k, v in WINDOWS.items()}
 
 
 class Spectrum:
@@ -86,6 +95,8 @@ class Spectrum:
         self.tmax  = np.zeros(trace_width, np.float32)
         self.stats = np.zeros(5, np.float32)
         self.times = np.zeros(5, np.float32)
+        self.window = 0
+        self.enbw = float(_l.adc_win_enbw(self.h))
 
     @property
     def dma_target(self):
@@ -98,6 +109,18 @@ class Spectrum:
             return
         n = nbytes // 2
         np.copyto(self.host[:n], self.stage[:n])
+
+    def set_window(self, win):
+        """win: name or id from WINDOWS. Rebuilds the window table and the
+        amplitude normalisation (coherent gain) on the device."""
+        wid = WINDOWS.get(win, win) if isinstance(win, str) else int(win)
+        if wid not in WINDOW_NAMES:
+            raise ValueError(f"unknown window {win!r}; use {list(WINDOWS)}")
+        if _l.adc_set_window(self.h, wid) != 0:
+            raise RuntimeError("adc_set_window failed")
+        self.window = wid
+        self.enbw = float(_l.adc_win_enbw(self.h))
+        return self.enbw
 
     def _p(self, a):
         return a.ctypes.data_as(_F)
