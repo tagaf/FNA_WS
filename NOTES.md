@@ -702,3 +702,40 @@ If the shorted reading is near 8192 this RESOLVES the open format question
 from section 4 (offset binary vs two's complement) -- record the number. If
 it is near 0 or full scale instead, that would be the anomaly. A new
 "vs mid-scale (8192)" row in the Signal panel makes the comparison direct.
+
+## 23. Shorted input reads ~12000, not 8192 -- open, 2026-09-04
+
+Reported: shorting the channel gives ~12k codes. Floating reads 186 (ch1) /
+140 (ch2). Neither coding hypothesis explains 12000 as "zero input":
+
+    offset binary   zero differential -> 8192   (12000 is +3808 off)
+    two's complement zero differential -> ~0    (12000 is -4384 signed)
+
+Three candidate explanations, in the order I would rank them:
+
+1. **The input is not biased into the converter's operating range.** There
+   is no analogue front end: no balun/transformer, no VCM bias network. The
+   AD9643 has differential inputs that need a common mode near mid-supply
+   (~0.9 V for a 1.8 V AVDD -- confirm against the datasheet). Shorting the
+   connector to ground drives the common mode to 0 V, outside that range, so
+   the output is not a meaningful "zero" at all. Floating is equally
+   undefined and rails. On this reading nothing is wrong with the decode --
+   the measurement itself is invalid.
+2. **ADC -> FPGA LVDS capture misalignment.** Important: the internal ramp
+   (channel 0) is generated INSIDE the FPGA, so every bit-packing fact
+   verified from it (section 4) says nothing about the ADC link. A wrong DDR
+   edge, swapped lanes or a shifted bit window would leave the ramp perfect
+   while scrambling real samples.
+3. A genuine decode error -- least likely, since bits 15:14 are always clear
+   on real data, which is what right-aligned 14-bit should look like.
+
+`diag_input.py` added to separate (1) from (2) without a signal generator:
+code histogram (regular gaps = stuck/mis-ordered bit, IEEE 1241 histogram
+test), per-bit toggle rates, even/odd split and lag-1/2/4 autocorrelation
+(DDR edge/interleave errors alternate in a way converter noise does not).
+Validated against injected faults: bit 3 forced low -> 42.9% missing codes
+and a stuck-low flag; a corrupted DDR edge -> even/odd delta -700 and
+acf lag1 -1.000 against -0.003 healthy.
+
+Still unresolved; needs a run with the input actually shorted, and
+ultimately a properly biased known signal.
