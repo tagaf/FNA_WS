@@ -142,6 +142,8 @@ tr:last-child td{border-bottom:0}
           <select id="nfft"></select>
           <label>FFT frames</label>
           <select id="max_frames" title="Welch segments averaged inside every capture. 1 = a true single FFT per capture (fluctuating noise floor); higher = smoother floor. This was hard-wired to 64 before, which is why the spectrum looked averaged even with the EMA off."></select>
+          <label>Sensitivity</label>
+          <select id="pfa_exp" title="Detection false-alarm probability. Lower Pfa = stricter = fewer marks. With no averaging a single FFT bin fluctuates by ~11 dB, so a strict threshold legitimately rejects bumps that are just noise; raising Welch frames or Trace avg is the physical way to reveal weak real peaks."></select>
           <label>Classify</label>
           <select id="classify" title="Detect spectral peaks (CFAR), group them into harmonic families, and label them. Runs ~1x/s in a background thread on the full-resolution spectrum, so it does not slow the capture loop."></select>
           <label>Trace avg</label>
@@ -255,11 +257,14 @@ opts($('speed'),[0,1,3,7,15,31,63,255],
      v=>`${v} — ${(250/(v+1)).toFixed(3)} Msps`,0);
 opts($('avg'),[1,2,4,8,16,32],v=>v==1?'1 (off)':v+'\u00d7 EMA',4);
 opts($('classify'),[0,1],v=>v?'on — label noise sources':'off',0);
+opts($('pfa_exp'),[2,3,4,6,9],
+     v=>({2:'1e-2 — most marks',3:'1e-3 — sensitive',4:'1e-4',
+          6:'1e-6 — default',9:'1e-9 — strict'})[v],6);
 opts($('max_frames'),[1,2,4,8,16,32,64,128,256],v=>v==1?'1 (single FFT)':v+'\u00d7 Welch',64);
 function fmtDur(sec){const [k,u]=axTimeUnit(sec);return axNum(sec*k)+' '+u}
 
 // ---- pending/applied confirmation for control changes
-const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames','classify'];
+const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames','classify','pfa_exp'];
 const pending={};
 function markPending(id){
   pending[id]=$(id).value;
@@ -447,6 +452,7 @@ function drawFreq(m,dispSpec,zoomSpec){
   $('fdInfo').textContent=zoomed
     ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · linear`
     :`${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
+  drawThreshold(m,g,Y,pxN);
   drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN);
   $('bZoomReset').style.display=zoomed?'':'none';
 }
@@ -498,6 +504,27 @@ function plotAt(x,g,pts,pxN,fallback){
   return (v==null||!isFinite(v))?fallback:v;
 }
 function famColor(i){return FAM_COLORS[i%FAM_COLORS.length]}
+
+// The CFAR detection threshold, on the same log grid as the overview. A
+// bump below this line is not "missed" -- at the current averaging depth it
+// is statistically indistinguishable from noise. Drawing it turns "why is
+// that peak unmarked?" into something you can just look at.
+function drawThreshold(m,g,Y,pxN){
+  const an=m.analysis;
+  if(!an||an.stale)return;
+  const st=(noiseStruct&&noiseStruct.sid===an.sid)?noiseStruct:null;
+  const tc=st&&st.thr_curve;
+  if(!tc||tc.length<2)return;
+  if(m.zoom&&m.zoom.active)return;         // grid only matches the overview
+  const c=g.c;
+  c.save();c.strokeStyle='rgba(240,163,94,.45)';c.lineWidth=1;c.setLineDash([4,4]);
+  c.beginPath();
+  for(let px=0;px<pxN;px++){
+    const t=tc[Math.min(tc.length-1,Math.floor(tc.length*px/pxN))];
+    const y=Y(t);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y);
+  }
+  c.stroke();c.restore();
+}
 
 function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN){
   const an=m.analysis;
@@ -601,8 +628,11 @@ function renderNoise(m){
     '<div class="nfam"><div class="nf"><div class="nd">no families above threshold</div></div></div>';
   $('noiseNote').innerHTML=`Every detected peak is marked; at most one marker
     per pixel is drawn (the most prominent), so zoom in to resolve the rest.
-    Levels are true per-bin peaks while the zoomed-out curve is a max
-    envelope. Floor ${f(an.floor_db,1)} dBFS, CFAR threshold
+    The dashed amber line is the detection threshold — anything under it is
+    not distinguishable from noise at this averaging depth, so raise
+    <b>FFT frames</b>/<b>Trace avg</b> (lowers the bar physically) or
+    <b>Sensitivity</b> (accepts more false alarms).
+    Floor ${f(an.floor_db,1)} dBFS, CFAR threshold
     +${f(an.thr_db,1)} dB (P<sub>fa</sub>=1e-6). Labels are inferred from
     structure — confirm a source by intervention (change fs, terminate the
     input, compare channels): <code>tools/emi_sweep.py</code>.`;

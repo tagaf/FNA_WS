@@ -338,6 +338,7 @@ class Engine:
                         trace_samples=-1,     # -1: trace shows the whole record
                                               # (explicit count still accepted)
                         classify=0,           # 1: run peak/noise classification
+                        pfa_exp=6,            # detection sensitivity: Pfa=1e-N
                         readback=-1)   # -1 auto, 0 full N, >0 explicit
         self.trace_width = trace_width
         self.min_period = min_period      # floor on loop period; leaves the
@@ -472,8 +473,8 @@ class Engine:
             if req is None:
                 continue
             try:
-                spec, bin_hz, fs, K, nfft, ch = req
-                r = noise.analyse(spec, bin_hz, fs, nframes=K, pfa=self.pfa,
+                spec, bin_hz, fs, K, nfft, ch, pfa = req
+                r = noise.analyse(spec, bin_hz, fs, nframes=K, pfa=pfa,
                                   max_peaks=self.MAX_WIRE_SPURS)
                 self._sid += 1
                 self.analysis = self._shape_analysis(r, fs, nfft, ch)
@@ -504,45 +505,59 @@ class Engine:
         if nb < 2 or bin_hz <= 0:
             return an
 
-        def levels(freqs):
-            """Local max over +-2 bins about each stored frequency.
+        offs = np.arange(-2, 3, dtype=np.int64)
+
+        def peak_level(freqs):
+            """Max level over +-2 bins about each frequency, vectorised.
 
             A single rounded bin can miss the true peak: the fundamental is
             refitted only once per structural pass, so a drifting switcher
-            moves between passes, and rounding can land a bin to either side.
-            Taking the neighbourhood max reports the peak itself rather than
-            its shoulder."""
-            if not freqs:
-                return []
-            idx = np.clip(np.rint(np.asarray(freqs, dtype=np.float64) / bin_hz)
-                          .astype(np.int64), 0, nb - 1)
-            lo = np.clip(idx - 2, 0, nb - 1)
-            hi = np.clip(idx + 3, 1, nb)
-            return [float(shown[a:b].max()) for a, b in zip(lo, hi)]
+            moves between passes and rounding can land on a shoulder.
 
-        def fam_live(f):
-            dbs = levels(f.get("freqs", []))
-            # peak_db drove the card and was never refreshed, so the number
-            # shown could disagree with the plot by a couple of dB
-            return dict(f, dbs=dbs, peak_db=(max(dbs) if dbs else f.get("peak_db")))
+            This runs on EVERY frame for every family member, and families
+            may now hold thousands of members, so it must not be a Python
+            loop -- one gather over an (n x 5) index matrix instead."""
+            if len(freqs) == 0:
+                return None
+            idx = np.rint(np.asarray(freqs, dtype=np.float64) / bin_hz)
+            idx = np.clip(idx.astype(np.int64)[:, None] + offs[None, :],
+                          0, nb - 1)
+            return float(shown[idx].max())
+
 
         # Frequencies are the bulk of the payload and change only when the
         # structure does, so they ride on /noise?sid=N instead of every
         # frame. Dots are drawn at the polyline's own value, so the client
         # needs no per-frame levels at all -- only the card's peak_db.
         out = {k: an[k] for k in ("sid", "ts", "fs_hz", "channel", "floor_db",
-                                  "thr_db", "n_peaks", "n_spurs_total")
+                                  "thr_db", "n_peaks", "n_spurs_total", "pfa")
                if k in an}
         out["families"] = [{k: f[k] for k in
                             ("id", "f0_hz", "label", "why", "n_members",
                              "density", "significance") if k in f}
-                           | {"peak_db": (max(levels(f.get("freqs", [])))
-                                          if f.get("freqs") else f.get("peak_db"))}
+                           | {"peak_db": (peak_level(f.get("freqs", []))
+                                          or f.get("peak_db"))}
                            for f in an.get("families", [])]
         out["structure_nfft"] = an.get("nfft")
         out["nfft"] = nfft
         out["live"] = True
         return out
+
+    THR_CURVE_PTS = 512
+
+    @staticmethod
+    def _thr_curve(floor_db, thr_db, npts):
+        """Detection threshold sampled on the same log-frequency grid the
+        display uses, so the client can draw it over the spectrum. Smooth by
+        construction, so a few hundred points suffice."""
+        nb = len(floor_db)
+        if nb < 4:
+            return []
+        idx = np.power(10.0, np.linspace(0.0, np.log10(nb - 1), npts + 1))
+        starts = np.maximum.accumulate(
+            np.clip(np.floor(idx[:-1]).astype(np.int64), 1, nb - 2)) - 1
+        vals = floor_db[np.clip(starts, 0, nb - 1)] + thr_db
+        return [round(float(v), 1) for v in vals]
 
     def _shape_analysis(self, r, fs, nfft, ch):
         """Trim to what the plot needs -- a full peak list can be thousands
@@ -577,6 +592,10 @@ class Engine:
             "thr_db": r["threshold_db_over_floor"],
             "n_peaks": r["n_peaks"],
             "n_spurs_total": len(spurs),
+            "pfa": r.get("pfa"),
+            "thr_curve": self._thr_curve(r["floor_curve"],
+                                         r["threshold_db_over_floor"],
+                                         self.THR_CURVE_PTS),
             "families": fams,
             # `why` is a whole sentence and repeats across hundreds of spurs;
             # send it once per label instead
@@ -700,12 +719,17 @@ class Engine:
 
         if cfg.get("classify"):
             now = time.monotonic()
-            if now - self._an_last >= self.classify_period:
+            # The snapshot is a full-spectrum copy (134 MB at nfft=2^27) taken
+            # in the capture loop, so its period scales with size: hold it to
+            # roughly 1% of a frame's own budget rather than a fixed 1 Hz.
+            period = max(self.classify_period, len(shown) * 4 / 1e9 * 100)
+            if now - self._an_last >= period:
                 with self._an_lock:
                     if self._an_req is None:          # only when idle
                         self._an_req = (shown.copy(), bin_hz, fs,
                                         max(1, self.sp.nframes * max(1, self._acc_n)),
-                                        nfft, ch)
+                                        nfft, ch,
+                                        10.0 ** -max(1, min(12, cfg.get("pfa_exp", 6))))
                         self._an_last = now
                         self._an_cv.notify()
         elif self.analysis is not None:
@@ -875,6 +899,7 @@ class Handler(BaseHTTPRequestHandler):
                 "sid": an.get("sid", 0),
                 "fs_hz": an.get("fs_hz"), "channel": an.get("channel"),
                 "why_by_label": an.get("why_by_label", {}),
+                "thr_curve": an.get("thr_curve", []),
                 "families": [{"id": f["id"],
                               "freqs": [round(x, 1) for x in f.get("freqs", [])]}
                              for f in an.get("families", [])],

@@ -561,3 +561,47 @@ p/q, test whether f0_a/p explains the union better) would fix it. Live
 hardware data does NOT show this -- there the 497.6 kHz family is recovered
 whole with 283 members -- so it is a sparse-comb failure mode, not a general
 one.
+
+## 19. Acquisition cost and detection coverage, 2026-09-04
+
+**"Classification slows acquisition."** Measured on the live server with the
+current build, medians over 14 frames, config restored afterwards:
+
+    nfft=2^20   loop 18.6 -> 18.4 ms   (-1%)
+    nfft=2^24   loop 168.1 -> 168.9 ms (+0%)
+
+So the current build costs nothing; the slowdown was the PREVIOUS one, which
+serialised thousands of member frequencies into every frame (fixed by the
+/noise split, section 18). Two latent hazards hardened anyway:
+* `levels()` was a Python loop over every family member, run per frame.
+  Harmless at 96 members, but the cap is now 4096 x 12 families = ~49k
+  iterations/frame. Replaced with a single gather over an (n x 5) index
+  matrix.
+* The worker snapshot is a full-spectrum copy (134 MB at 2^27) taken in the
+  capture loop; its period now scales with spectrum size (~1% of a frame's
+  budget) instead of a fixed 1 Hz.
+
+**"Not all peaks are marked."** Measured: 100% of DETECTED peaks now reach
+the browser (1524 sent of 1524 found). But only 35% of *visible bumps*
+(>=4 dB over a rolling local median in the drawn overview) were marked, and
+the unmarked ones stood 4-10 dB over that median against a CFAR threshold of
++11.40 dB. That threshold is not arbitrary: at avg=1 / welch=1 the power is
+exponentially distributed, so -ln(1e-6) = 11.40 dB is exactly the bar for
+one false alarm in a million bins. A 10 dB bump in a single periodogram
+genuinely IS plausible noise.
+
+Rather than quietly loosening it:
+* The CFAR threshold is now DRAWN over the spectrum (dashed amber, 512-point
+  curve shipped on /noise), so "why is that peak unmarked?" is answerable by
+  looking.
+* A **Sensitivity** control exposes Pfa (1e-2 .. 1e-9). Verified 1e-6 -> 1e-2
+  drops the threshold 11.40 -> 6.63 dB and takes peaks 2 -> 4331.
+* The card states that averaging is the physical fix. Verified: welch 1 ->
+  32 drops the threshold 11.40 -> 3.17 dB, matching cfar_alpha_db theory
+  exactly, because real peaks survive averaging while noise does not.
+
+Measurement note: two intermediate readings here were artifacts of the test,
+not the code -- a naive fps A/B again showed a bogus 55% (the control run
+afterwards came back lower than the treatment), and a Welch threshold looked
+stuck at 11.40 dB because the frame still carried the PREVIOUS analysis.
+Both needed waiting for a fresh `sid` / interleaved sampling to see straight.

@@ -432,7 +432,9 @@ def analyse(spec_db, bin_hz, fs_hz, nframes=1, pfa=1e-6, f_offset=0.0,
     fams, peaks = classify(peaks, fams, fs_hz, bin_hz, signal_hz)
     return {
         "floor_db": float(np.median(floor)),
+        "floor_curve": floor,
         "threshold_db_over_floor": cfar_alpha_db(nframes, pfa),
+        "pfa": float(pfa),
         "n_peaks": len(peaks),
         "peaks": peaks,
         "families": fams,
