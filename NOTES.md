@@ -529,3 +529,35 @@ Also: near-duplicate detections within 3 bins (one broad peak with a dip)
 are collapsed, keeping the most prominent of each cluster. Spur markers are
 now drawn with size and opacity scaled by prominence, so density does not
 flatten into undifferentiated clutter.
+
+## 18. Marking every detected peak, 2026-09-04
+
+`MAX_WIRE_SPURS` raised 600 -> 20000 and members 512 -> 4096, i.e. every
+detected peak is now marked. Three changes made that affordable:
+
+* **Detection and sieving decoupled.** `analyse(max_peaks=...)` bounds what
+  is detected (and markable); `family_peaks=1200` bounds what is fed to the
+  harmonic sieve, whose cost grows with peak count. Marking wants
+  completeness, sieving wants the prominent lines that define a comb. The
+  sieve input is a slice of the same list, so member identity (used by
+  `classify`) is preserved.
+* **Compact wire format.** `/noise` sends parallel arrays (`spur_f`,
+  `spur_p`, `spur_l`) with a label table instead of per-peak objects with a
+  repeated `why` sentence: measured 14.1 B/marker vs 51 B/marker, 3.6x
+  smaller. 362 markers = 5.1 kB = ~7 ms on the 6 Mbit/s link, fetched only
+  when `sid` changes.
+* **Per-pixel reduction when drawing.** Thousands of peaks against ~1200
+  plot pixels would overdraw and cost canvas calls for nothing. The client
+  keeps at most one marker per pixel (the most prominent); zooming reveals
+  the rest because the full list is already client-side.
+
+**Known limitation (unresolved).** On a synthetic comb with steeply decaying
+harmonics, the sieve split one 497.6 kHz source into families at 995.2 kHz
+(2f0) and 1492.8 kHz (3f0): once the upper harmonics fall below threshold
+the surviving subset is sparse and irregular, and the multiples score better
+per member. `_merge_families` only folds INTEGER ratios, so 995.2 and
+1492.8 (ratio 3/2) never merged. A rational-ratio consolidation (find small
+p/q, test whether f0_a/p explains the union better) would fix it. Live
+hardware data does NOT show this -- there the 497.6 kHz family is recovered
+whole with 283 members -- so it is a sparse-comb failure mode, not a general
+one.

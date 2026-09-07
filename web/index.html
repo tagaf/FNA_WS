@@ -471,6 +471,26 @@ async function ensureNoiseStruct(sid){
     if(r.ok){const j=await r.json(); if(j&&j.sid)noiseStruct=j}
   }catch(e){}finally{noiseFetching=false}
 }
+// At full coverage there can be thousands of peaks against ~1200 plot
+// pixels, so most markers would overdraw each other and cost canvas calls
+// for nothing. Reduce to at most one marker per pixel, keeping the most
+// prominent -- visually identical, and zooming still reveals the rest
+// because the full list is held client-side.
+let _bkP=null,_bkI=null;
+function pixelReduce(freqs,proms,Xf,x0,pxN,fLo,fHi){
+  if(!_bkP||_bkP.length<pxN){_bkP=new Float32Array(pxN);_bkI=new Int32Array(pxN)}
+  _bkP.fill(-1e30,0,pxN);_bkI.fill(-1,0,pxN);
+  const n=freqs.length;
+  for(let i=0;i<n;i++){
+    const f=freqs[i];
+    if(f<fLo||f>fHi)continue;
+    const px=Math.round(Xf(f)-x0);
+    if(px<0||px>=pxN)continue;
+    const p=proms?proms[i]:0;
+    if(p>_bkP[px]){_bkP[px]=p;_bkI[px]=i}
+  }
+  return _bkI;
+}
 function plotAt(x,g,pts,pxN,fallback){
   if(!pts||!pxN)return fallback;
   const px=Math.max(0,Math.min(pxN-1,Math.round(x-g.x0)));
@@ -496,10 +516,11 @@ function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN){
     const col=famColor(fam.id!=null?fam.id:i);
     c.strokeStyle=col;c.fillStyle=col;c.lineWidth=1;
     const ff=freqsOf(fam.id);
-    for(let k=0;k<ff.length;k++){
-      const f=ff[k];
-      if(f<fLo||f>fHi)continue;
-      const x=Xf(f);
+    const sel=pixelReduce(ff,null,Xf,g.x0,pxN,fLo,fHi);
+    for(let px=0;px<pxN;px++){
+      const k=sel[px];
+      if(k<0)continue;
+      const x=Xf(ff[k]);
       c.beginPath();c.moveTo(x,tickTop);c.lineTo(x,tickTop+tickLen);c.stroke();
       // Sit the dot on the value the polyline actually has at this pixel.
       // In the overview one pixel max-pools thousands of bins, so a dot
@@ -511,15 +532,18 @@ function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN){
   });
   c.fillStyle=SPUR_COLOR;c.strokeStyle=SPUR_COLOR;
   // fainter and shorter as prominence falls, so the eye still ranks them
-  (st.spurs||[]).forEach(sp=>{
-    if(sp.f<fLo||sp.f>fHi)return;
-    const x=Xf(sp.f);
-    const w=Math.max(0.25,Math.min(1,(sp.p||0)/12));
+  const sf=st.spur_f||[], sp_=st.spur_p||[];
+  const ssel=pixelReduce(sf,sp_,Xf,g.x0,pxN,fLo,fHi);
+  for(let px=0;px<pxN;px++){
+    const i=ssel[px];
+    if(i<0)continue;
+    const x=Xf(sf[i]);
+    const w=Math.max(0.25,Math.min(1,(sp_[i]||0)/12));
     c.globalAlpha=0.35+0.65*w;
     c.beginPath();c.moveTo(x,tickTop);c.lineTo(x,tickTop+tickLen*(0.4+0.6*w));c.stroke();
     c.beginPath();c.arc(x,Y(plotAt(x,g,pts,pxN,null)),1.1+0.9*w,0,7);c.fill();
-    c.globalAlpha=1;
-  });
+  }
+  c.globalAlpha=1;
 }
 
 function drawBudget(a){
@@ -564,19 +588,21 @@ function renderNoise(m){
         · ${f(fam.significance,0)}σ · peak ${f(fam.peak_db,1)} dBFS</div></div></div>`;
   });
   const stc=(noiseStruct&&noiseStruct.sid===an.sid)?noiseStruct:null;
-  if(stc&&stc.spurs.length){
-    const top=stc.spurs.slice(0,5);
+  if(stc&&(stc.spur_f||[]).length){
+    const n=stc.spur_f.length;
+    const top=[];
+    for(let i=0;i<Math.min(5,n);i++)top.push(eng(stc.spur_f[i])+' +'+f(stc.spur_p[i],1)+' dB');
     rows.push(`<div class="nfam"><i style="background:${SPUR_COLOR}"></i><div class="nf">
-      <div class="nt">${an.n_spurs_total||stc.spurs.length} unmatched lines
-        ${stc.spurs.length<(an.n_spurs_total||0)?`(${stc.spurs.length} marked)`:''}</div>
-      <div class="nd">strongest by prominence: ${top.map(x=>eng(x.f)+' +'+f(x.p,1)+' dB').join(' · ')}</div>
+      <div class="nt">${n} unmatched lines · all marked</div>
+      <div class="nd">strongest by prominence: ${top.join(' · ')}</div>
       </div></div>`);
   }
   $('noiseList').innerHTML=rows.join('')||
     '<div class="nfam"><div class="nf"><div class="nd">no families above threshold</div></div></div>';
-  $('noiseNote').innerHTML=`Levels are true per-bin peaks; in the zoomed-out
-    overview one pixel spans many bins and the curve draws their maximum, so
-    markers ride the envelope. Floor ${f(an.floor_db,1)} dBFS, CFAR threshold
+  $('noiseNote').innerHTML=`Every detected peak is marked; at most one marker
+    per pixel is drawn (the most prominent), so zoom in to resolve the rest.
+    Levels are true per-bin peaks while the zoomed-out curve is a max
+    envelope. Floor ${f(an.floor_db,1)} dBFS, CFAR threshold
     +${f(an.thr_db,1)} dB (P<sub>fa</sub>=1e-6). Labels are inferred from
     structure — confirm a source by intervention (change fs, terminate the
     input, compare channels): <code>tools/emi_sweep.py</code>.`;

@@ -410,12 +410,25 @@ def classify(peaks, families, fs_hz, bin_hz, signal_hz=None):
 
 
 def analyse(spec_db, bin_hz, fs_hz, nframes=1, pfa=1e-6, f_offset=0.0,
-            signal_hz=None, min_members=3, max_peaks=4000):
-    """Convenience wrapper: floor -> CFAR -> families -> labels."""
+            signal_hz=None, min_members=3, max_peaks=20000,
+            family_peaks=1200):
+    """Convenience wrapper: floor -> CFAR -> families -> labels.
+
+    `max_peaks` bounds what is DETECTED (and therefore markable);
+    `family_peaks` bounds what is fed to the harmonic sieve, whose cost grows
+    with peak count. Marking every peak and sieving every peak are different
+    jobs: the display wants completeness, the sieve wants the prominent lines
+    that actually define a comb. Sieve input is a slice of the same list, so
+    member identity (used by classify) is preserved.
+    """
     floor = estimate_floor(spec_db, nframes)
     peaks = detect_peaks(spec_db, floor, bin_hz, nframes, pfa,
                          f_offset=f_offset, max_peaks=max_peaks)
-    fams = find_families(peaks, bin_hz, min_members=min_members)
+    fam_in = peaks
+    if len(peaks) > family_peaks:
+        fam_in = sorted(peaks, key=lambda p: -p.get("prominence_db", p["db"]))
+        fam_in = sorted(fam_in[:family_peaks], key=lambda p: p["freq_hz"])
+    fams = find_families(fam_in, bin_hz, min_members=min_members)
     fams, peaks = classify(peaks, fams, fs_hz, bin_hz, signal_hz)
     return {
         "floor_db": float(np.median(floor)),

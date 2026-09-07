@@ -459,8 +459,9 @@ class Engine:
     # separately via /noise and only when it changes, so these can be
     # generous without bloating the per-frame payload.
     MAX_WIRE_FAMILIES = 12
-    MAX_WIRE_MEMBERS = 512
-    MAX_WIRE_SPURS = 600
+    MAX_WIRE_MEMBERS = 4096
+    MAX_WIRE_SPURS = 20000     # mark every detected peak; /noise is fetched
+                               # once per structure change, not per frame
 
     def _analysis_loop(self):
         while not self._stop.is_set():
@@ -473,7 +474,7 @@ class Engine:
             try:
                 spec, bin_hz, fs, K, nfft, ch = req
                 r = noise.analyse(spec, bin_hz, fs, nframes=K, pfa=self.pfa,
-                                  max_peaks=4000)
+                                  max_peaks=self.MAX_WIRE_SPURS)
                 self._sid += 1
                 self.analysis = self._shape_analysis(r, fs, nfft, ch)
             except Exception as e:
@@ -867,8 +868,9 @@ class Handler(BaseHTTPRequestHandler):
             # by the client only when the frame's `sid` changes.
             an = self.engine.analysis
             if not an or an.get("error"):
-                return self._send(503, b'{"sid":0,"families":[],"spurs":[]}',
+                return self._send(503, b'{"sid":0,"families":[],"spur_f":[]}',
                                   "application/json")
+            labels = {}
             body = json.dumps({
                 "sid": an.get("sid", 0),
                 "fs_hz": an.get("fs_hz"), "channel": an.get("channel"),
@@ -876,12 +878,19 @@ class Handler(BaseHTTPRequestHandler):
                 "families": [{"id": f["id"],
                               "freqs": [round(x, 1) for x in f.get("freqs", [])]}
                              for f in an.get("families", [])],
-                "spurs": [{"f": round(s["freq_hz"], 1),
-                           "p": round(s.get("prom", 0.0), 2),
-                           "l": s.get("label", "")}
-                          for s in an.get("spurs", [])],
-            }).encode()
-            return self._send(200, body, "application/json")
+                # parallel arrays, not per-peak objects: at a few thousand
+                # peaks the repeated JSON keys and label strings dominate
+                "spur_f": [int(round(s["freq_hz"])) for s in an.get("spurs", [])],
+                "spur_p": [round(s.get("prom", 0.0), 1) for s in an.get("spurs", [])],
+                "spur_l": [labels.setdefault(s.get("label", ""), len(labels))
+                           for s in an.get("spurs", [])],
+                "label_names": None,   # filled below
+            })
+            body = body.replace('"label_names": null',
+                                '"label_names": ' + json.dumps(
+                                    [k for k, _ in sorted(labels.items(),
+                                                          key=lambda kv: kv[1])]))
+            return self._send(200, body.encode(), "application/json")
         if p == "/limits":
             return self._send(200, json.dumps({
                 "granularity": A.SAMPLE_GRANULARITY,
