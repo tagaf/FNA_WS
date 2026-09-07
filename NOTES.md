@@ -438,3 +438,34 @@ every family member, one hue per family, grey for unmatched lines, and a
 density, significance, peak level). Enabled by the `Classify` control
 (default off).
 
+
+## 15. Marker sync + sieve made O(n log n), 2026-09-04
+
+Two problems, reported as "markers do not update every FFT refresh".
+
+**1. find_families was quadratic-ish.** `collect()` ran a Python loop doing
+`argmin` over the whole peak array per harmonic: O(candidates x harmonics x
+peaks). Fine for the tens of peaks in the unit tests, hopeless on a real
+spectrum -- a live capture yields ~1500 peaks and ~18k candidates, i.e.
+billions of comparisons and minutes per pass, which is why the first live
+analysis took so long to appear. Replaced with `searchsorted` over the
+already-sorted frequencies plus fully vectorised tolerance tests, and
+candidates are now deduplicated onto a resolution grid (raw 1 mHz rounding
+kept thousands of candidates differing by far less than the match
+tolerance) with pairwise differences seeded only from the strongest 400
+peaks. Measured 1600 peaks: minutes -> 546 ms. Full analyse() end to end:
+0.17 / 0.51 / 1.28 s at 2^20 / 2^24 / 2^26 bins.
+
+**2. Marker levels must not wait on the structural pass.** Family
+*frequencies* drift slowly, but their *levels* change every frame, so
+markers drawn from a 1 Hz analysis visibly lag the trace. The server now
+re-samples the stored family/spur frequencies against the CURRENT spectrum
+on every frame (`_live_analysis`, a few hundred lookups) while the worker
+keeps refreshing the structure in the background. Frequencies are physical,
+so this also survives an nfft change -- only the bin mapping moves. fs or
+channel changing does invalidate the structure (aliasing differs; different
+source), and that now returns an explicit `stale` flag the UI renders as
+"reanalysing" instead of drawing ticks from the wrong spectrum.
+
+Verified in mock: marker level changes frame-to-frame, structure survives
+2^20 -> 2^18, channel change flags stale.

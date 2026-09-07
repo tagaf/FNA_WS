@@ -34,6 +34,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.special import gammainccinv, gammaincinv
 
+CAND_PEAK_LIMIT = 400   # peaks used to seed pairwise-difference candidates
+
 __all__ = ["estimate_floor", "cfar_alpha_db", "detect_peaks",
            "find_families", "classify", "analyse"]
 
@@ -173,31 +175,57 @@ def find_families(peaks, bin_hz, min_members=3, max_harmonic=64,
     band = max(fmax - fmin, bin_hz)
     npk = len(freqs)
 
+    # Candidates: peak frequencies themselves, plus pairwise differences (a
+    # comb whose fundamental sits below the band still shows as a constant
+    # spacing). Deduplicate onto a resolution grid -- raw rounding to 1 mHz
+    # keeps thousands of candidates that differ by far less than the matching
+    # tolerance and cost a full evaluate() each.
+    def _grid(f):
+        step = max(bin_hz, abs(f) * 1e-4)
+        return round(float(f) / step) * step
+
     cands = set()
     for f in freqs:
         if f > 0:
-            cands.add(round(float(f), 3))
-    for i in range(npk):
-        for j in range(i + 1, min(i + 12, npk)):
-            d = float(freqs[j] - freqs[i])
+            cands.add(_grid(f))
+    strong = np.argsort(amps)[::-1][:CAND_PEAK_LIMIT]
+    strong = np.sort(strong)
+    for a in range(len(strong)):
+        for b in range(a + 1, min(a + 12, len(strong))):
+            d = float(freqs[strong[b]] - freqs[strong[a]])
             if d > max(2 * bin_hz, 1.0):
-                cands.add(round(d, 3))
+                cands.add(_grid(d))
 
     def collect(f0, tol_fn, claimed=None):
-        nmax = int(min(max_harmonic, np.floor(fmax / f0))) if f0 > 0 else 0
-        members = []
-        for h in range(1, nmax + 1):
-            ft = h * f0
-            k = int(np.argmin(np.abs(freqs - ft)))
-            if claimed is not None and claimed[k]:
-                continue
-            if abs(freqs[k] - ft) <= tol_fn(h, ft):
-                members.append((h, k))
-        return members
+        """Vectorised nearest-peak lookup for every harmonic at once.
+
+        This was a Python loop doing argmin over the whole peak array per
+        harmonic: O(candidates x harmonics x peaks). Fine for the tens of
+        peaks in the unit tests, hopeless on real spectra -- a live capture
+        yields ~1500 peaks and ~18k candidates, which is billions of
+        comparisons and minutes per analysis. searchsorted on the (already
+        sorted) frequencies makes it O(harmonics log peaks)."""
+        if f0 <= 0:
+            return []
+        nmax = int(min(max_harmonic, np.floor(fmax / f0)))
+        if nmax < 1:
+            return []
+        h = np.arange(1, nmax + 1, dtype=np.float64)
+        ft = h * f0
+        j = np.searchsorted(freqs, ft)
+        lo = np.clip(j - 1, 0, npk - 1)
+        hi = np.clip(j, 0, npk - 1)
+        dl = np.abs(freqs[lo] - ft)
+        dh = np.abs(freqs[hi] - ft)
+        k = np.where(dl <= dh, lo, hi)
+        ok = np.minimum(dl, dh) <= tol_fn(h, ft)
+        if claimed is not None:
+            ok &= ~claimed[k]
+        return list(zip(h[ok].astype(np.int64).tolist(), k[ok].tolist()))
 
     def evaluate(f0, claimed=None):
         """Two-pass fit -> (members, f0_fit, density, significance)."""
-        loose = lambda h, ft: max(3.0 * bin_hz, rel_tol * ft)
+        loose = lambda h, ft: np.maximum(3.0 * bin_hz, rel_tol * ft)
         m = collect(f0, loose, claimed)
         if len(m) < min_members:
             return None
@@ -206,7 +234,7 @@ def find_families(peaks, bin_hz, min_members=3, max_harmonic=64,
         f0_fit = float(np.sum(mf * mh) / np.sum(mh * mh))
         if f0_fit <= 0:
             return None
-        tight = lambda h, ft: max(3.0 * bin_hz, 5e-5 * ft)
+        tight = lambda h, ft: np.maximum(3.0 * bin_hz, 5e-5 * ft)
         m = collect(f0_fit, tight, claimed)
         if len(m) < min_members:
             return None

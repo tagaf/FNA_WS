@@ -476,6 +476,44 @@ class Engine:
                 with self._an_lock:
                     self._an_req = None
 
+    def _live_analysis(self, shown, bin_hz, fs, nfft, ch):
+        """Re-sample the stored family/spur frequencies against the CURRENT
+        spectrum, every frame.
+
+        The structural result (which frequencies belong to which family) comes
+        from the ~1 Hz worker, but marker *levels* must track the trace or the
+        dots visibly lag it. Frequencies are physical, so they stay valid when
+        nfft changes -- only the bin mapping moves, and re-deriving it is a few
+        hundred lookups. fs or channel changing does invalidate the structure
+        (aliasing differs; a different source entirely), so that still clears.
+        """
+        an = self.analysis
+        if not an or an.get("error"):
+            return an
+        if an.get("channel") != ch or abs(an.get("fs_hz", 0.0) - fs) > 1.0:
+            return {"stale": True, "reason": "fs/channel changed",
+                    "families": [], "spurs": []}
+        nb = len(shown)
+        if nb < 2 or bin_hz <= 0:
+            return an
+
+        def levels(freqs):
+            if not freqs:
+                return []
+            idx = np.clip(np.rint(np.asarray(freqs, dtype=np.float64) / bin_hz)
+                          .astype(np.int64), 0, nb - 1)
+            return [float(v) for v in shown[idx]]
+
+        out = dict(an)
+        out["families"] = [dict(f, dbs=levels(f.get("freqs", [])))
+                           for f in an.get("families", [])]
+        out["spurs"] = [dict(sp, db=(levels([sp["freq_hz"]]) or [sp["db"]])[0])
+                        for sp in an.get("spurs", [])]
+        out["structure_nfft"] = an.get("nfft")
+        out["nfft"] = nfft          # levels are current: markers are in sync
+        out["live"] = True
+        return out
+
     def _shape_analysis(self, r, fs, nfft, ch):
         """Trim to what the plot needs -- a full peak list can be thousands
         of entries and would dwarf the spectrum payload itself."""
@@ -706,7 +744,8 @@ class Engine:
                 "avg_depth": self._acc_n,
             },
             "sys": self.sysmon.sample(),
-            "analysis": self.analysis,
+            "analysis": self._live_analysis(shown, bin_hz, fs, nfft, ch)
+                        if cfg.get("classify") else None,
             "err": self.err,
         }
         hdr = json.dumps(m).encode()

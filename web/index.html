@@ -461,9 +461,11 @@ function famColor(i){return FAM_COLORS[i%FAM_COLORS.length]}
 function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,lo,hi){
   const an=m.analysis;
   if(!an||an.error||!an.families)return;
-  // an analysis computed under a different fs/nfft describes a different
-  // spectrum -- draw nothing rather than mismatched ticks
-  if(Math.abs(an.fs_hz-m.fs_hz)>1||an.nfft!==m.cfg.nfft||an.channel!==m.cfg.channel)return;
+  // The server re-samples marker levels against the current spectrum every
+  // frame, so `nfft` here already matches the frame; only an fs/channel
+  // change invalidates the structure, and that arrives flagged stale.
+  if(an.stale)return;
+  if(Math.abs(an.fs_hz-m.fs_hz)>1||an.channel!==m.cfg.channel)return;
   const c=g.c||$('cFreq').getContext('2d');
   const tickTop=g.y0+2, tickLen=7;
   an.families.forEach((fam,i)=>{
@@ -515,9 +517,10 @@ function renderNoise(m){
     $('noiseNote').textContent='First pass runs within ~1 s of enabling.';return}
   if(an.error){$('noiseInfo').textContent='error';
     $('noiseList').innerHTML='';$('noiseNote').textContent=an.error;return}
-  const stale=Math.abs(an.fs_hz-m.fs_hz)>1||an.nfft!==m.cfg.nfft||an.channel!==m.cfg.channel;
-  $('noiseInfo').textContent=stale?'stale — reanalysing…'
-    :`${an.n_peaks} peaks · ${an.families.length} families`;
+  if(an.stale){$('noiseInfo').textContent='reanalysing…';$('noiseList').innerHTML='';
+    $('noiseNote').textContent=`Configuration changed (${an.reason}); the next pass lands within ~1 s.`;return}
+  $('noiseInfo').textContent=`${an.n_peaks} peaks · ${an.families.length} families`
+    + (an.structure_nfft&&an.structure_nfft!==m.cfg.nfft?' · refitting':'');
   const rows=an.families.map((fam,i)=>{
     const col=famColor(fam.id!=null?fam.id:i);
     return `<div class="nfam"><i style="background:${col}"></i><div class="nf">
