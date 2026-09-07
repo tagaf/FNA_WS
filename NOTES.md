@@ -767,3 +767,42 @@ Three details that mattered:
 Cost measured in node at full plot size (1450x280 = 406k cells):
 0.49 ms accumulate+decay, 1.27 ms render with a precomputed colour LUT, so
 ~1.8 ms/frame, about 5% of one core at 30 fps.
+
+## 25. Correction: the test-pattern origin is NOT settled, 2026-09-04
+
+User: "I think the test pattern is generated inside the AD9643." Section 2
+claimed the opposite, and that claim was weaker than it was written.
+
+The argument was: the ramp steps by 1 at every `Speed_Set`, so it must be
+generated after the decimation point, i.e. inside the FPGA. That only
+follows **if the divider drops samples**. If it divides the encode clock
+instead, the ADC converts more slowly and its own ramp also steps by 1 --
+the observation cannot distinguish the two.
+
+Aliasing test to decide which the divider does (ch1, 5-20 MHz median floor,
+avg depth >=12, nfft 2^20):
+
+    speed=0  fs=250.0 MHz   -117.89 dBFS
+    speed=1  fs=125.0 MHz   -116.94 dBFS   (+0.95 dB)
+    speed=3  fs= 62.5 MHz   -114.40 dBFS   (+3.49 dB)
+
+Naive sample-dropping folds everything above the new Nyquist into the band
+unfiltered. The 60-125 MHz region sits ~25 dB above the low-band floor here,
+so folding would lift 5-20 MHz by tens of dB. It moves 1-3.5 dB. So the
+divider is **not** a naive full-band decimator, which removes the basis for
+the section 2 inference. (It does not cleanly prove clock division either --
+for white noise at fixed nfft the dBFS floor should not move at all with fs,
+and it moves a little.)
+
+Remaining evidence for FPGA-internal: channel 0 is bit-identical run to run
+and always starts at code 0, i.e. it is reset by the capture trigger. A
+free-running ADC pattern would start at an arbitrary phase -- though an FPGA
+could reset the ADC's generator too.
+
+**Why this matters:** if the ramp really comes from the AD9643, it traverses
+the LVDS/DDR capture, and a perfect 16.7M-sample ramp then PROVES that link
+is bit-exact -- which would rule out capture misalignment as the explanation
+for the ~12000 shorted reading (section 23) and point squarely at input
+biasing. Decisive tests: read the AD9643's SPI registers if the FPGA exposes
+them, or power down, remove the mezzanine, and see whether a channel-0
+capture still completes.
