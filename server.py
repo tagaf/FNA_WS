@@ -498,15 +498,29 @@ class Engine:
             return an
 
         def levels(freqs):
+            """Local max over +-2 bins about each stored frequency.
+
+            A single rounded bin can miss the true peak: the fundamental is
+            refitted only once per structural pass, so a drifting switcher
+            moves between passes, and rounding can land a bin to either side.
+            Taking the neighbourhood max reports the peak itself rather than
+            its shoulder."""
             if not freqs:
                 return []
             idx = np.clip(np.rint(np.asarray(freqs, dtype=np.float64) / bin_hz)
                           .astype(np.int64), 0, nb - 1)
-            return [float(v) for v in shown[idx]]
+            lo = np.clip(idx - 2, 0, nb - 1)
+            hi = np.clip(idx + 3, 1, nb)
+            return [float(shown[a:b].max()) for a, b in zip(lo, hi)]
+
+        def fam_live(f):
+            dbs = levels(f.get("freqs", []))
+            # peak_db drove the card and was never refreshed, so the number
+            # shown could disagree with the plot by a couple of dB
+            return dict(f, dbs=dbs, peak_db=(max(dbs) if dbs else f.get("peak_db")))
 
         out = dict(an)
-        out["families"] = [dict(f, dbs=levels(f.get("freqs", [])))
-                           for f in an.get("families", [])]
+        out["families"] = [fam_live(f) for f in an.get("families", [])]
         out["spurs"] = [dict(sp, db=(levels([sp["freq_hz"]]) or [sp["db"]])[0])
                         for sp in an.get("spurs", [])]
         out["structure_nfft"] = an.get("nfft")

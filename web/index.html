@@ -447,7 +447,7 @@ function drawFreq(m,dispSpec,zoomSpec){
   $('fdInfo').textContent=zoomed
     ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · linear`
     :`${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
-  drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,lo,hi);
+  drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN);
   $('bZoomReset').style.display=zoomed?'':'none';
 }
 
@@ -456,9 +456,15 @@ function drawFreq(m,dispSpec,zoomSpec){
 const FAM_COLORS=['#f06a6a','#b48ef0','#7ee787','#f0a35e','#5ea8f0',
                   '#e86ab8','#d6d635','#59d6c3'];
 const SPUR_COLOR='#8fa3bd';
+function plotAt(x,g,pts,pxN,fallback){
+  if(!pts||!pxN)return fallback;
+  const px=Math.max(0,Math.min(pxN-1,Math.round(x-g.x0)));
+  const v=pts[px];
+  return (v==null||!isFinite(v))?fallback:v;
+}
 function famColor(i){return FAM_COLORS[i%FAM_COLORS.length]}
 
-function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,lo,hi){
+function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN){
   const an=m.analysis;
   if(!an||an.error||!an.families)return;
   // The server re-samples marker levels against the current spectrum every
@@ -476,7 +482,11 @@ function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,lo,hi){
       if(f<fLo||f>fHi)continue;
       const x=Xf(f);
       c.beginPath();c.moveTo(x,tickTop);c.lineTo(x,tickTop+tickLen);c.stroke();
-      const y=Y(fam.dbs[k]);
+      // Sit the dot on the value the polyline actually has at this pixel.
+      // In the overview one pixel max-pools thousands of bins, so a dot
+      // placed at the single-bin level floats several dB below the curve it
+      // is meant to annotate; zoomed in, pixel ~ bin and the two coincide.
+      const y=Y(plotAt(x,g,pts,pxN,fam.dbs[k]));
       c.beginPath();c.arc(x,y,1.9,0,7);c.fill();
     }
   });
@@ -485,7 +495,7 @@ function drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,lo,hi){
     if(sp.freq_hz<fLo||sp.freq_hz>fHi)return;
     const x=Xf(sp.freq_hz);
     c.beginPath();c.moveTo(x,tickTop);c.lineTo(x,tickTop+tickLen*0.6);c.stroke();
-    c.beginPath();c.arc(x,Y(sp.db),1.6,0,7);c.fill();
+    c.beginPath();c.arc(x,Y(plotAt(x,g,pts,pxN,sp.db)),1.6,0,7);c.fill();
   });
 }
 
@@ -537,7 +547,9 @@ function renderNoise(m){
   }
   $('noiseList').innerHTML=rows.join('')||
     '<div class="nfam"><div class="nf"><div class="nd">no families above threshold</div></div></div>';
-  $('noiseNote').innerHTML=`Floor ${f(an.floor_db,1)} dBFS, CFAR threshold
+  $('noiseNote').innerHTML=`Levels are true per-bin peaks; in the zoomed-out
+    overview one pixel spans many bins and the curve draws their maximum, so
+    markers ride the envelope. Floor ${f(an.floor_db,1)} dBFS, CFAR threshold
     +${f(an.thr_db,1)} dB (P<sub>fa</sub>=1e-6). Labels are inferred from
     structure — confirm a source by intervention (change fs, terminate the
     input, compare channels): <code>tools/emi_sweep.py</code>.`;

@@ -469,3 +469,32 @@ source), and that now returns an explicit `stale` flag the UI renders as
 
 Verified in mock: marker level changes frame-to-frame, structure survives
 2^20 -> 2^18, channel change flags stale.
+
+## 16. Marker amplitudes vs the drawn curve, 2026-09-04
+
+Reported as "peak amplitudes often do not match the plot", suspected
+averaging. Measured on live data instead: the discrepancy is strongly
+frequency-dependent and it is not averaging.
+
+    0.5 - 7.5 MHz    marker - plot = +0.00 dB   (exact)
+    118 - 124 MHz    marker - plot = -1.0 to -4.5 dB
+
+Cause: the overview is 4096 points spaced in log(f) and MAX-pooled, and the
+client max-pools again per pixel. Below ~10 MHz a display point covers about
+one bin so marker and curve coincide exactly. Above ~100 MHz one point pools
+thousands of bins and the curve draws their maximum, while the marker drew a
+single bin at the harmonic frequency -- arithmetically correct but visually
+floating several dB under the envelope it annotates.
+
+Fixes:
+* Dots are now drawn at the value the polyline actually has at that pixel
+  (`plotAt()`), so they sit on the curve by construction at every zoom.
+  Zoomed in, pixel ~ bin and this degenerates to the true per-bin level.
+* `levels()` takes a local max over +-2 bins rather than one rounded bin:
+  the fundamental is refitted only once per structural pass, so a drifting
+  switcher moves between passes and rounding can land on a shoulder.
+* `peak_db` (the number in the Noise sources card) was carried from the
+  analysis snapshot and never refreshed -- up to 2.9 dB adrift from the
+  plot. It is now recomputed from the live levels each frame.
+* The card states that levels are true per-bin peaks while the zoomed-out
+  curve is a max envelope, so the two are read correctly.
