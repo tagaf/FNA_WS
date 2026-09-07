@@ -53,6 +53,11 @@ h1 span{color:var(--accent)}
 .card h2 button{background:#1b2431;color:var(--warn);border:1px solid #5c4a2b;
   border-radius:5px;padding:2px 8px;font:11px var(--mono);cursor:pointer}
 .card h2 button:hover{background:#243141}
+.card h2 label.chk{display:flex;align-items:center;gap:5px;cursor:pointer;
+  color:var(--dim);text-transform:none;letter-spacing:0;font-weight:500;
+  font-size:11px}
+.card h2 label.chk:hover{color:var(--fg)}
+.card h2 label.chk input{width:auto;margin:0;padding:0;accent-color:var(--accent)}
 #cFreq{cursor:crosshair}
 canvas{display:block;width:100%;height:280px;background:var(--panel2)}
 .ctl{display:grid;grid-template-columns:auto 1fr;gap:7px 10px;padding:12px;align-items:center}
@@ -110,7 +115,14 @@ tr:last-child td{border-bottom:0}
   <div class="mainlayout">
     <div class="plots">
       <div class="card">
-        <h2>Time domain <em id="tdInfo">–</em></h2>
+        <h2>Time domain
+          <span>
+            <label class="chk" title="Freeze the vertical scale at its current range. Autoscaling makes a shrinking signal look unchanged, since the axis shrinks with it; locking lets you see real amplitude changes.">
+              <input type="checkbox" id="tLock"> lock Y
+            </label>
+            <em id="tdInfo">–</em>
+          </span>
+        </h2>
         <canvas id="cTime"></canvas>
       </div>
       <div class="card">
@@ -335,6 +347,7 @@ function axes(c,w,h,xt,yt,xl,yl){
 
 // ---- autoscale with light smoothing so bounds don't jump every frame
 let tBounds=null, fBounds=null;
+let tLock=false, tLockBounds=null;   // frozen time-domain Y range
 function ema(prev,lo,hi,k){
   if(!prev||!isFinite(prev.lo)||!isFinite(prev.hi))return {lo,hi};
   return {lo:prev.lo+(lo-prev.lo)*k, hi:prev.hi+(hi-prev.hi)*k};
@@ -355,7 +368,13 @@ function drawTime(m,tmin,tmax){
   for(let i=0;i<n;i++){if(tmin[i]<lo)lo=tmin[i];if(tmax[i]>hi)hi=tmax[i]}
   if(!isFinite(lo)){lo=0;hi=16383}
   const pad=Math.max(4,(hi-lo)*0.08);lo-=pad;hi+=pad;
-  tBounds=ema(tBounds,lo,hi,0.3);lo=tBounds.lo;hi=tBounds.hi;
+  tBounds=ema(tBounds,lo,hi,0.3);
+  // keep tracking the live range even while locked, so unlocking resumes
+  // from where the signal actually is rather than snapping
+  if(tLock){
+    if(!tLockBounds)tLockBounds={lo:tBounds.lo,hi:tBounds.hi};
+    lo=tLockBounds.lo;hi=tLockBounds.hi;
+  }else{lo=tBounds.lo;hi=tBounds.hi}
   const dur_s=(m.acq.trace_samples||m.acq.read_samples||m.cfg.nsamples)/m.fs_hz;
   const [tk,tu]=axTimeUnit(dur_s);
   const xt=[0,.25,.5,.75,1].map(p=>({p,l:axNum(dur_s*p*tk)+tu}));
@@ -371,7 +390,8 @@ function drawTime(m,tmin,tmax){
   c.beginPath();
   for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1),y=Y((tmin[i]+tmax[i])/2);i?c.lineTo(x,y):c.moveTo(x,y)}
   c.stroke();
-  $('tdInfo').textContent=`${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu} · envelope ${n} cols`;
+  $('tdInfo').textContent=`${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu}`
+    + ` · envelope ${n} cols` + (tLock?' · Y locked':'');
 }
 
 // Spectrum: log frequency (x) × dB (y, already log-magnitude) = log-log for
@@ -858,6 +878,10 @@ $('bSingle').addEventListener('click',()=>{
   singlePending=true;singleT0=performance.now();singleBaseline=lastFrames;
   $('bSingle').disabled=true;$('bSingle').textContent='Capturing…';
   send({trigger:true});
+});
+$('tLock').addEventListener('change',e=>{
+  tLock=e.target.checked;
+  tLockBounds=tLock?(tBounds?{lo:tBounds.lo,hi:tBounds.hi}:null):null;
 });
 $('bReset').addEventListener('click',()=>location.reload());
 $('bRestart').addEventListener('click',async()=>{

@@ -184,6 +184,10 @@ measured behaviour and the one open ambiguity.
 Use a low-sidelobe window (`blackman-harris`) for spur hunting; Hann's
 -31.5 dB sidelobes let a strong tone's skirt be detected as spurs.
 
+The time-domain plot autoscales; the **lock Y** checkbox in its header
+freezes the vertical range at its current value, so a signal that shrinks
+actually looks smaller instead of the axis shrinking with it.
+
 In the UI, the **Classify** control turns on live labelling: each detected
 family gets a colour, with ticks above the spectrum and dots on the trace at
 its harmonics, and a *Noise sources* card lists the families (fundamental,
