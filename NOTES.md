@@ -637,3 +637,37 @@ symptom, and references to payload fields removed during the /noise split
 fail silently as `undefined`. The test node --check's the extracted script,
 greps for known-dead field references, verifies every `$('id')` exists in
 the markup, and checks each server-side control is wired.
+
+## 21. "GUI switches between live and disconnected", 2026-09-04
+
+Not a crash -- the journal showed no unhandled server exits (the restart
+counter was my own `systemctl restart`s). The cause is bandwidth:
+
+    frame payload  26,548 B
+    engine rate    66 fps
+    demand         14.0 Mbit/s
+    Orin WiFi link ~7 Mbit/s (RSSI -76 dBm)
+
+The client asked for every frame the engine produced, i.e. twice what the
+link can carry, so TCP queued until fetches failed -- and a single failed
+fetch flipped the badge straight to "disconnected". Four fixes:
+
+* **Client pacing.** Requests are now spaced by an EWMA of how long a frame
+  actually takes to arrive (floor 33 ms, ceiling 1 s). The long-poll always
+  returns the NEWEST frame, so backing off simply skips frames, which is the
+  correct behaviour on a slow link. The badge reports "N fps shown" when
+  pacing is active.
+* **Payload halved (wire format 2).** Spectrum as int16 hundredths of a dB
+  (0.01 dB steps against a display resolving ~0.1 dB); envelope as uint16,
+  which is EXACT since those are 14-bit ADC codes. 26,548 -> 14,288 B, so
+  30 fps costs 3.4 Mbit/s instead of 6.4.
+* **Badge hysteresis.** Three consecutive failures before "disconnected";
+  one hiccup shows "reconnecting" and retries with backoff.
+* **Quiet client disconnects + shorter park.** `_send` swallows
+  BrokenPipe/ConnectionReset (a client vanishing mid-response is normal and
+  was logging a traceback each time), and the long-poll park dropped 25 s ->
+  10 s, since a 25 s idle connection is prime NAT/AP reaping material.
+
+Also moved `SysMon` off the capture loop: it read /proc/net/wireless
+(~1.5 ms) every frame and shelled out to `iw` (~4 ms) every 5 s, all inline.
+It now samples on its own 1 Hz timer and the loop reads a cached dict.

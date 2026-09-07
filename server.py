@@ -349,6 +349,12 @@ class Engine:
         self.frame = None
         self.err = None
         self.sysmon = SysMon()
+        # SysMon reads /proc/net/wireless (~1.5 ms) every call and shells out
+        # to `iw` (~4 ms) every 5 s. Called per frame that is ~10% of a 15 ms
+        # frame plus a periodic hiccup, all of it inside the capture loop.
+        # Sample it on its own timer instead and hand the loop a cached dict.
+        self._sys_cache = self.sysmon.sample()
+        self._sys_th = None
         self._stop = threading.Event()
         self._dirty = threading.Event()
         self._single = threading.Event()   # set by trigger(): arm exactly one capture
@@ -392,6 +398,8 @@ class Engine:
         self.th.start()
         self.an_th = threading.Thread(target=self._analysis_loop, daemon=True)
         self.an_th.start()
+        self._sys_th = threading.Thread(target=self._sys_loop, daemon=True)
+        self._sys_th.start()
 
     def stop(self):
         self._stop.set()
@@ -463,6 +471,14 @@ class Engine:
     MAX_WIRE_MEMBERS = 4096
     MAX_WIRE_SPURS = 20000     # mark every detected peak; /noise is fetched
                                # once per structure change, not per frame
+
+    def _sys_loop(self):
+        while not self._stop.is_set():
+            try:
+                self._sys_cache = self.sysmon.sample()
+            except Exception:
+                pass
+            self._stop.wait(1.0)
 
     def _analysis_loop(self):
         while not self._stop.is_set():
@@ -809,15 +825,27 @@ class Engine:
                 "uptime_s": time.monotonic() - self.t_start,
                 "avg_depth": self._acc_n,
             },
-            "sys": self.sysmon.sample(),
+            "sys": self._sys_cache,
             "analysis": self._live_analysis(shown, bin_hz, fs, nfft, ch)
                         if cfg.get("classify") else None,
             "err": self.err,
         }
+        # Halve the wire size: the spectrum goes as int16 hundredths of a dB
+        # (0.01 dB steps against a display that resolves ~0.1 dB) and the
+        # envelope as uint16, which is EXACT because those are 14-bit ADC
+        # codes. 26.5 kB/frame at 66 fps is 14 Mbit/s on a 7 Mbit/s link;
+        # this brings it to ~3.4 Mbit/s at 30 fps.
+        m["wire"] = 2
+        m["disp_scale"] = 100.0
         hdr = json.dumps(m).encode()
+        d16 = np.clip(disp, -320.0, 40.0).astype(np.float32) * 100.0
+        z16 = (np.clip(np.frombuffer(zoom_bytes, dtype=np.float32),
+                       -320.0, 40.0) * 100.0).astype(np.int16) \
+              if zoom_bytes else np.zeros(0, np.int16)
         blob = (struct.pack("<I", len(hdr)) + hdr +
-                disp.tobytes() + zoom_bytes +
-                self.sp.tmin.tobytes() + self.sp.tmax.tobytes())
+                d16.astype(np.int16).tobytes() + z16.tobytes() +
+                np.clip(self.sp.tmin, 0, 65535).astype(np.uint16).tobytes() +
+                np.clip(self.sp.tmax, 0, 65535).astype(np.uint16).tobytes())
         with self.new_frame:
             self.frame = blob
             self.new_frame.notify_all()   # wake every long-poll waiter
@@ -846,6 +874,14 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, body, ctype):
+        try:
+            self._send_inner(code, body, ctype)
+        except (BrokenPipeError, ConnectionResetError):
+            # the client went away (reload, navigation, or a dropped link
+            # while parked on a long-poll). Normal; not worth a traceback.
+            self.close_connection = True
+
+    def _send_inner(self, code, body, ctype):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -874,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
             e = self.engine
             if q.get("wait") == "1":
                 since = int(q.get("since", "0") or 0)
-                deadline = time.monotonic() + 25.0
+                deadline = time.monotonic() + 10.0
                 with e.new_frame:
                     while (e.tot_frames <= since or e.frame is None):
                         left = deadline - time.monotonic()

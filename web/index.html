@@ -732,6 +732,7 @@ function render(m,dispSpec,zoomSpec,tmin,tmax){
       txt=`${bars} ${f(r,0)} dBm`+(nn.tx_mbps?` · ${f(nn.tx_mbps,0)} Mb/s`:'');
     }
     if(netLag>5)txt+=` · lag ${f(netLag,0)} ms`;
+    if(paceMs>45)txt+=` · ${f(1000/Math.max(33,paceMs*0.9),0)} fps shown`;
     const bad=(nn&&nn.rssi_dbm<-80)||netLag>400, warn=(nn&&nn.rssi_dbm<-70)||netLag>150;
     $('stNet').textContent=txt;
     $('stNet').className='badge '+(bad?'err':warn?'off':'on');
@@ -773,9 +774,12 @@ setInterval(()=>{
 // old status-poll-per-animation-frame this cuts the request rate ~10x and,
 // on a lossy WiFi link, turns "a burst of delayed polls" into "one delayed
 // frame", which is the difference between stutter and a barely-visible skip.
-let netLag=0;   // EWMA ms: frame arrival delay beyond engine production time
+let netLag=0;    // EWMA ms: frame arrival delay beyond engine production time
+let netFails=0;  // consecutive failures, so one hiccup does not flip the badge
+let paceMs=0;    // EWMA of how long a frame actually takes to arrive
 async function poll(){
   while(true){
+    const tStart=performance.now();
     try{
       const t0=performance.now();
       const r=await fetch('/frame?wait=1&since='+(lastFrames<0?0:lastFrames),
@@ -785,14 +789,21 @@ async function poll(){
         const dv=new DataView(buf);const hl=dv.getUint32(0,true);
         const m=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,4,hl)));
         let off=4+hl;
-        const dispSpec=new Float32Array(buf.slice(off,off+m.disp_bins*4));off+=m.disp_bins*4;
+        // wire 2: spectrum as int16 hundredths of a dB, envelope as uint16
+        // ADC codes (exact). Halves the payload on a link that cannot carry
+        // the engine's full frame rate anyway.
+        const sc=m.disp_scale||100;
+        const i16=(n)=>{const a=new Int16Array(buf.slice(off,off+n*2));off+=n*2;
+                        const o=new Float32Array(n);
+                        for(let i=0;i<n;i++)o[i]=a[i]/sc;return o};
+        const u16=(n)=>{const a=new Uint16Array(buf.slice(off,off+n*2));off+=n*2;
+                        const o=new Float32Array(n);
+                        for(let i=0;i<n;i++)o[i]=a[i];return o};
+        const dispSpec=i16(m.disp_bins);
         let zoomSpec=null;
-        if(m.zoom&&m.zoom.active&&m.zoom.bins>0){
-          zoomSpec=new Float32Array(buf.slice(off,off+m.zoom.bins*4));off+=m.zoom.bins*4;
-        }
+        if(m.zoom&&m.zoom.active&&m.zoom.bins>0)zoomSpec=i16(m.zoom.bins);
         const tw=m.trace_width;
-        const tmin=new Float32Array(buf.slice(off,off+tw*4));off+=tw*4;
-        const tmax=new Float32Array(buf.slice(off,off+tw*4));
+        const tmin=u16(tw), tmax=u16(tw);
         const lag=Math.max(0,(performance.now()-t0)-m.acq.loop_ms);
         netLag=netLag?netLag*0.75+lag*0.25:lag;
         lastFrames=m.totals.frames;
@@ -814,11 +825,25 @@ async function poll(){
         }
         if(r.status===503)await new Promise(rs=>setTimeout(rs,300));
       }
+      netFails=0;
       $('st').textContent='live';$('st').className='badge on';
     }catch(e){
-      $('st').textContent='disconnected';$('st').className='badge err';
-      await new Promise(rs=>setTimeout(rs,500));
+      // A single failed fetch is normal on a marginal link; only call it
+      // disconnected once several in a row fail, otherwise the badge flaps.
+      netFails++;
+      if(netFails>=3){$('st').textContent='disconnected';$('st').className='badge err'}
+      else{$('st').textContent='reconnecting…';$('st').className='badge off'}
+      await new Promise(rs=>setTimeout(rs,Math.min(2000,300*netFails)));
     }
+    // Pace requests to what the link actually sustains. The engine can
+    // produce 66 fps of ~27 kB frames (~14 Mbit/s) on a 7 Mbit/s link; asking
+    // for every one of them saturates it, queues TCP, and ends in timeouts
+    // that look like disconnections. The long-poll always returns the NEWEST
+    // frame, so backing off just skips frames -- which is exactly right.
+    const took=performance.now()-tStart;
+    paceMs=paceMs?paceMs*0.7+took*0.3:took;
+    const gap=Math.max(33,Math.min(1000,paceMs*0.9))-(performance.now()-tStart);
+    if(gap>0)await new Promise(rs=>setTimeout(rs,gap));
     await new Promise(rs=>requestAnimationFrame(rs));
   }
 }

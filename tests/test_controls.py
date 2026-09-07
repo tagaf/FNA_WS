@@ -19,11 +19,16 @@ def post(o):
                               headers={"Content-Type":"application/json"})
     return urllib.request.urlopen(rq,timeout=5).read()
 def frame(since,t=12):
+    # NOTE: parses wire format 2 (int16 dB*100 + uint16 codes). A mismatch
+    # shows up as "buffer size must be a multiple of element size".
+
     r=get(f"/frame?wait=1&since={since}",t)
     b=r.read()
     if r.status!=200: return r.status,None,None
     hl=struct.unpack("<I",b[:4])[0]; m=json.loads(b[4:4+hl]); off=4+hl
-    disp=np.frombuffer(b[off:off+m["disp_bins"]*4],np.float32)
+    # wire 2: spectrum is int16 hundredths of a dB
+    sc=m.get("disp_scale",100.0)
+    disp=np.frombuffer(b[off:off+m["disp_bins"]*2],np.int16).astype(np.float64)/sc
     return 200,m,disp
 
 fails=[]
@@ -121,8 +126,9 @@ try:
     m,disp,last=applied({"nfft":65536},last)
     z=m["zoom"]; okz=z["active"] and z["bins"]>0
     r=get(f"/frame?wait=1&since={last-1}"); b=r.read()
-    hl=struct.unpack("<I",b[:4])[0]; mm=json.loads(b[4:4+hl]); off=4+hl+mm["disp_bins"]*4
-    zs=np.frombuffer(b[off:off+mm["zoom"]["bins"]*4],np.float32)
+    hl=struct.unpack("<I",b[:4])[0]; mm=json.loads(b[4:4+hl]); off=4+hl+mm["disp_bins"]*2
+    zsc=mm.get("disp_scale",100.0)
+    zs=np.frombuffer(b[off:off+mm["zoom"]["bins"]*2],np.int16).astype(np.float64)/zsc
     zi=int(np.argmax(zs)); zf=mm["zoom"]["lo_hz"]+zi*mm["zoom"]["bin_hz"]
     okz&=abs(zf-25e6)<=2*mm["zoom"]["bin_hz"]
     chk("zoom",okz,f"zoom peak {zf/1e6:.4f} MHz bins={mm['zoom']['bins']}")
