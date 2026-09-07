@@ -117,8 +117,8 @@ tr:last-child td{border-bottom:0}
       <div class="card">
         <h2>Time domain
           <span>
-            <label class="chk" title="Freeze the vertical scale at its current range. Autoscaling makes a shrinking signal look unchanged, since the axis shrinks with it; locking lets you see real amplitude changes.">
-              <input type="checkbox" id="tLock"> lock Y
+            <label class="chk" title="Lock the vertical axis to the ADC's full 14-bit range (0–16383 codes). Autoscaling makes a shrinking signal look unchanged because the axis shrinks with it; full scale shows how much of the converter you are actually using.">
+              <input type="checkbox" id="tLock"> full scale
             </label>
             <em id="tdInfo">–</em>
           </span>
@@ -347,7 +347,9 @@ function axes(c,w,h,xt,yt,xl,yl){
 
 // ---- autoscale with light smoothing so bounds don't jump every frame
 let tBounds=null, fBounds=null;
-let tLock=false, tLockBounds=null;   // frozen time-domain Y range
+// 14-bit unsigned, right-aligned: codes run 0..16383 (NOTES.md section 4)
+const ADC_MIN=0, ADC_MAX=16383;
+let tLock=false;                     // lock the time-domain Y to full scale
 function ema(prev,lo,hi,k){
   if(!prev||!isFinite(prev.lo)||!isFinite(prev.hi))return {lo,hi};
   return {lo:prev.lo+(lo-prev.lo)*k, hi:prev.hi+(hi-prev.hi)*k};
@@ -368,13 +370,11 @@ function drawTime(m,tmin,tmax){
   for(let i=0;i<n;i++){if(tmin[i]<lo)lo=tmin[i];if(tmax[i]>hi)hi=tmax[i]}
   if(!isFinite(lo)){lo=0;hi=16383}
   const pad=Math.max(4,(hi-lo)*0.08);lo-=pad;hi+=pad;
-  tBounds=ema(tBounds,lo,hi,0.3);
   // keep tracking the live range even while locked, so unlocking resumes
   // from where the signal actually is rather than snapping
-  if(tLock){
-    if(!tLockBounds)tLockBounds={lo:tBounds.lo,hi:tBounds.hi};
-    lo=tLockBounds.lo;hi=tLockBounds.hi;
-  }else{lo=tBounds.lo;hi=tBounds.hi}
+  tBounds=ema(tBounds,lo,hi,0.3);
+  if(tLock){lo=ADC_MIN;hi=ADC_MAX}
+  else{lo=tBounds.lo;hi=tBounds.hi}
   const dur_s=(m.acq.trace_samples||m.acq.read_samples||m.cfg.nsamples)/m.fs_hz;
   const [tk,tu]=axTimeUnit(dur_s);
   const xt=[0,.25,.5,.75,1].map(p=>({p,l:axNum(dur_s*p*tk)+tu}));
@@ -391,7 +391,8 @@ function drawTime(m,tmin,tmax){
   for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1),y=Y((tmin[i]+tmax[i])/2);i?c.lineTo(x,y):c.moveTo(x,y)}
   c.stroke();
   $('tdInfo').textContent=`${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu}`
-    + ` · envelope ${n} cols` + (tLock?' · Y locked':'');
+    + ` · envelope ${n} cols`
+    + (tLock?` · full scale 0–${ADC_MAX}`:' · autoscaled');
 }
 
 // Spectrum: log frequency (x) × dB (y, already log-magnitude) = log-log for
@@ -879,10 +880,7 @@ $('bSingle').addEventListener('click',()=>{
   $('bSingle').disabled=true;$('bSingle').textContent='Capturing…';
   send({trigger:true});
 });
-$('tLock').addEventListener('change',e=>{
-  tLock=e.target.checked;
-  tLockBounds=tLock?(tBounds?{lo:tBounds.lo,hi:tBounds.hi}:null):null;
-});
+$('tLock').addEventListener('change',e=>{tLock=e.target.checked});
 $('bReset').addEventListener('click',()=>location.reload());
 $('bRestart').addEventListener('click',async()=>{
   if(!confirm('Restart the whole server process?\n\nThis drops the live feed for EVERYONE currently viewing this page, not just you, and the engine comes back with its default startup config rather than your current settings.\n\nContinue?'))return;

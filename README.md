@@ -184,9 +184,12 @@ measured behaviour and the one open ambiguity.
 Use a low-sidelobe window (`blackman-harris`) for spur hunting; Hann's
 -31.5 dB sidelobes let a strong tone's skirt be detected as spurs.
 
-The time-domain plot autoscales; the **lock Y** checkbox in its header
-freezes the vertical range at its current value, so a signal that shrinks
-actually looks smaller instead of the axis shrinking with it.
+The time-domain plot autoscales; the **full scale** checkbox in its header
+locks the vertical axis to the ADC's full 14-bit range (0-16383 codes), so
+you can see how much of the converter a signal actually uses. With no
+analogue front end and a floating input that is a nearly flat line near the
+bottom -- which is the honest picture (~0.5 LSB of noise on a 16384-code
+range).
 
 In the UI, the **Classify** control turns on live labelling: each detected
 family gets a colour, with ticks above the spectrum and dots on the trace at
