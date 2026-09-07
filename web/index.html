@@ -363,7 +363,7 @@ function logTicks(lo,hi){
   return out.length>=2?out:[lo,hi];
 }
 
-function drawTime(m,tmin,tmax){
+function drawTime(m,tmin,tmax,tmean){
   const {c,w,h}=setup($('cTime'));
   const n=tmin.length;
   let lo=Infinity,hi=-Infinity;
@@ -388,10 +388,14 @@ function drawTime(m,tmin,tmax){
   c.closePath();c.fillStyle='rgba(126,231,135,.22)';c.fill();
   c.strokeStyle='#7ee787';c.lineWidth=1;
   c.beginPath();
-  for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1),y=Y((tmin[i]+tmax[i])/2);i?c.lineTo(x,y):c.moveTo(x,y)}
+  for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1);
+    // true per-column mean, not (min+max)/2 -- the envelope midpoint sits
+    // where no sample necessarily is once the signal is asymmetric
+    const y=Y(tmean?tmean[i]:(tmin[i]+tmax[i])/2);
+    i?c.lineTo(x,y):c.moveTo(x,y)}
   c.stroke();
   $('tdInfo').textContent=`${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu}`
-    + ` · envelope ${n} cols`
+    + ` · shaded = min…max per column, line = mean`
     + (tLock?` · full scale 0–${ADC_MAX}`:' · autoscaled');
 }
 
@@ -687,9 +691,9 @@ function syncControlsFromServer(m){
   if($('nsamples').value)buildNfftOpts(+$('nsamples').value);
 }
 
-function render(m,dispSpec,zoomSpec,tmin,tmax){
+function render(m,dispSpec,zoomSpec,tmin,tmax,tmean){
   syncControlsFromServer(m);
-  drawTime(m,tmin,tmax);drawFreq(m,dispSpec,zoomSpec);drawBudget(m.acq);
+  drawTime(m,tmin,tmax,tmean);drawFreq(m,dispSpec,zoomSpec);drawBudget(m.acq);
   renderNoise(m);checkApplied(m);
   const a=m.acq,g=m.gpu,s=m.sig,y=m.sys,t=m.totals;
   const cov=a.coverage_pct;
@@ -731,6 +735,12 @@ function render(m,dispSpec,zoomSpec,tmin,tmax){
     ['noise floor (med)',f(s.noise_db,1)+' dBFS'],
     ['peak / floor',f(s.snr_db,1)+' dB'],
     ['mean (DC)',f(s.mean,1)+' codes'],
+    // 8192 is mid-scale for 14-bit offset binary, i.e. zero differential
+    // input. How far the mean sits from it is the single most diagnostic
+    // number for a floating vs terminated vs shorted input.
+    ['vs mid-scale (8192)',f(s.mean-8192,0)+' codes',
+       Math.abs(s.mean-8192)>6000?'v-warn':''],
+    ['full-scale used',f(100*s.vpp_codes/16384,2)+' %'],
     ['std (RMS ac)',f(s.std,2)+' codes'],
     ['min / max',s.min+' / '+s.max],
     ['pk-pk',s.vpp_codes+' codes'],
@@ -825,6 +835,15 @@ async function poll(){
         if(m.zoom&&m.zoom.active&&m.zoom.bins>0)zoomSpec=i16(m.zoom.bins);
         const tw=m.trace_width;
         const tmin=u16(tw), tmax=u16(tw);
+        // wire 3 adds the per-column MEAN (quarter-code units). An older
+        // server stops after tmax, so fall back to the envelope midpoint.
+        let tmean=null;
+        if((m.wire||2)>=3&&off+tw*2<=buf.byteLength){
+          const ms=m.tmean_scale||4;
+          const a=new Uint16Array(buf.slice(off,off+tw*2));off+=tw*2;
+          tmean=new Float32Array(tw);
+          for(let i=0;i<tw;i++)tmean[i]=a[i]/ms;
+        }
         const lag=Math.max(0,(performance.now()-t0)-m.acq.loop_ms);
         netLag=netLag?netLag*0.75+lag*0.25:lag;
         lastFrames=m.totals.frames;
@@ -833,7 +852,7 @@ async function poll(){
         if(singlePending && (lastFrames>singleBaseline)){
           singlePending=false;$('bSingle').disabled=false;$('bSingle').textContent='⚡ Single';
         }
-        render(m,dispSpec,zoomSpec,tmin,tmax);
+        render(m,dispSpec,zoomSpec,tmin,tmax,tmean);
         flashDot();
       }else if(r.status===204||r.status===503){
         // nothing new inside the window (paused engine, or an error is

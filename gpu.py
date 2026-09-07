@@ -52,7 +52,7 @@ _l.adc_maxframes.argtypes = [ctypes.c_void_p]; _l.adc_maxframes.restype = ctypes
 _F = ctypes.POINTER(ctypes.c_float)
 _l.adc_process.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                            ctypes.c_int,
-                           _F, _F, _F, _F, _F, ctypes.POINTER(ctypes.c_int)]
+                           _F, _F, _F, _F, _F, _F, ctypes.POINTER(ctypes.c_int)]
 _l.adc_process.restype = ctypes.c_int
 _l.adc_set_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
 _l.adc_set_window.restype = ctypes.c_int
@@ -93,6 +93,7 @@ class Spectrum:
         self.spec  = np.zeros(self.nbins, np.float32)
         self.tmin  = np.zeros(trace_width, np.float32)
         self.tmax  = np.zeros(trace_width, np.float32)
+        self.tmean = np.zeros(trace_width, np.float32)
         self.stats = np.zeros(5, np.float32)
         self.times = np.zeros(5, np.float32)
         self.window = 0
@@ -132,6 +133,7 @@ class Spectrum:
         nf = ctypes.c_int()
         rc = _l.adc_process(self.h, nsamples, max_frames, trace_n,
                             self._p(self.spec), self._p(self.tmin), self._p(self.tmax),
+                            self._p(self.tmean),
                             self._p(self.stats), self._p(self.times), ctypes.byref(nf))
         if rc != 0:
             raise RuntimeError(f"adc_process rc={rc}")

@@ -835,7 +835,8 @@ class Engine:
         # envelope as uint16, which is EXACT because those are 14-bit ADC
         # codes. 26.5 kB/frame at 66 fps is 14 Mbit/s on a 7 Mbit/s link;
         # this brings it to ~3.4 Mbit/s at 30 fps.
-        m["wire"] = 2
+        m["wire"] = 3
+        m["tmean_scale"] = 4.0
         m["disp_scale"] = 100.0
         hdr = json.dumps(m).encode()
         d16 = np.clip(disp, -320.0, 40.0).astype(np.float32) * 100.0
@@ -845,7 +846,9 @@ class Engine:
         blob = (struct.pack("<I", len(hdr)) + hdr +
                 d16.astype(np.int16).tobytes() + z16.tobytes() +
                 np.clip(self.sp.tmin, 0, 65535).astype(np.uint16).tobytes() +
-                np.clip(self.sp.tmax, 0, 65535).astype(np.uint16).tobytes())
+                np.clip(self.sp.tmax, 0, 65535).astype(np.uint16).tobytes() +
+                # mean carries fractional codes, so send quarter-code units
+                np.clip(self.sp.tmean * 4.0, 0, 65535).astype(np.uint16).tobytes())
         with self.new_frame:
             self.frame = blob
             self.new_frame.notify_all()   # wake every long-poll waiter

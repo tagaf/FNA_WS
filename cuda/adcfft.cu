@@ -17,7 +17,7 @@ struct FftCtx {
     unsigned short *d_raw;
     float *d_f, *d_win, *d_pow, *d_spec;
     float *d_part;                // partial reductions
-    float *d_tmin, *d_tmax;
+    float *d_tmin, *d_tmax, *d_tmean;
     cufftComplex *d_c;
     int max_frames;
     int win_type;
@@ -105,19 +105,25 @@ __global__ void k_db(const float*p,float*db,int nbins,float norm){
 }
 
 // min/max envelope decimation: one block per output column
-__global__ void k_env(const unsigned short*x,int n,float*mn,float*mx,int tw){
+// min/max/mean envelope decimation: one block per output column. The mean
+// matters: the drawn centre line used to be (min+max)/2, the midpoint of the
+// envelope, which for asymmetric noise or an offset signal sits somewhere no
+// sample actually is.
+__global__ void k_env(const unsigned short*x,int n,float*mn,float*mx,float*mv,int tw){
     int col=blockIdx.x; if(col>=tw) return;
     long a=(long)n*col/tw, b=(long)n*(col+1)/tw; if(b<=a) b=a+1;
-    __shared__ float sm[MAXB],sx[MAXB];
-    float lo=1e30f,hi=-1e30f;
-    for(long i=a+threadIdx.x;i<b;i+=blockDim.x){ float v=(float)x[i]; lo=fminf(lo,v); hi=fmaxf(hi,v); }
-    sm[threadIdx.x]=lo; sx[threadIdx.x]=hi; __syncthreads();
+    __shared__ float sm[MAXB],sx[MAXB],ss[MAXB];
+    float lo=1e30f,hi=-1e30f,sum=0.0f;
+    for(long i=a+threadIdx.x;i<b;i+=blockDim.x){ float v=(float)x[i];
+        lo=fminf(lo,v); hi=fmaxf(hi,v); sum+=v; }
+    sm[threadIdx.x]=lo; sx[threadIdx.x]=hi; ss[threadIdx.x]=sum; __syncthreads();
     for(int d=blockDim.x/2;d>0;d>>=1){
         if(threadIdx.x<d){ sm[threadIdx.x]=fminf(sm[threadIdx.x],sm[threadIdx.x+d]);
-                           sx[threadIdx.x]=fmaxf(sx[threadIdx.x],sx[threadIdx.x+d]); }
+                           sx[threadIdx.x]=fmaxf(sx[threadIdx.x],sx[threadIdx.x+d]);
+                           ss[threadIdx.x]+=ss[threadIdx.x+d]; }
         __syncthreads();
     }
-    if(threadIdx.x==0){ mn[col]=sm[0]; mx[col]=sx[0]; }
+    if(threadIdx.x==0){ mn[col]=sm[0]; mx[col]=sx[0]; mv[col]=ss[0]/(float)(b-a); }
 }
 
 #define CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
@@ -156,6 +162,7 @@ FftCtx* adc_create(int nfft,int maxs,int tw){
     CK(cudaMalloc(&c->d_part,(size_t)4*MAXB*sizeof(float)+8*sizeof(float)));
     CK(cudaMalloc(&c->d_tmin,(size_t)tw*sizeof(float)));
     CK(cudaMalloc(&c->d_tmax,(size_t)tw*sizeof(float)));
+    CK(cudaMalloc(&c->d_tmean,(size_t)tw*sizeof(float)));
     CK(cudaMalloc(&c->d_c,(size_t)c->max_frames*c->nbins*sizeof(cufftComplex)));
     CK(cudaStreamCreate(&c->s));
     CK(cudaEventCreate(&c->e0)); CK(cudaEventCreate(&c->e1)); CK(cudaEventCreate(&c->e2));
@@ -169,7 +176,8 @@ int adc_nbins(FftCtx*c){ return c->nbins; }
 int adc_maxframes(FftCtx*c){ return c->max_frames; }
 
 int adc_process(FftCtx*c,int nsamples,int max_frames,int trace_n,
-                float*spec,float*tmin,float*tmax,float*stats,float*times,int*nframes_out){
+                float*spec,float*tmin,float*tmax,float*tmean,
+                float*stats,float*times,int*nframes_out){
     int nfft=c->nfft, frames=nsamples/nfft;
     if(trace_n<=0||trace_n>nsamples) trace_n=nsamples;   // envelope span, decoupled from FFT
     if(frames<1) return -1;
@@ -198,7 +206,8 @@ int adc_process(FftCtx*c,int nsamples,int max_frames,int trace_n,
     // cudaStreamSynchronize stalling the stream every frame
     k_win<<<(tot+255)/256,256,0,c->s>>>(c->d_raw,c->d_f,c->d_win,nfft,frames,
                                         c->d_part+4*MAXB);
-    k_env<<<c->tw,MAXB,0,c->s>>>(c->d_raw,trace_n,c->d_tmin,c->d_tmax,c->tw);
+    k_env<<<c->tw,MAXB,0,c->s>>>(c->d_raw,trace_n,c->d_tmin,c->d_tmax,
+                                 c->d_tmean,c->tw);
     cudaEventRecord(c->e2,c->s);
 
     cufftExecR2C(c->plan,c->d_f,d_c);
@@ -211,6 +220,7 @@ int adc_process(FftCtx*c,int nsamples,int max_frames,int trace_n,
     cudaMemcpyAsync(spec,c->d_spec,(size_t)c->nbins*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmin,c->d_tmin,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmax,c->d_tmax,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
+    cudaMemcpyAsync(tmean,c->d_tmean,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     float h_stats[5];
     cudaMemcpyAsync(h_stats,c->d_part+4*MAXB,5*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaEventRecord(c->e4,c->s);
@@ -231,7 +241,7 @@ void adc_destroy(FftCtx*c){
     if(c->plan_frames) cufftDestroy(c->plan);
     cudaFreeHost(c->h_in); cudaFree(c->d_raw); cudaFree(c->d_f); cudaFree(c->d_win);
     cudaFree(c->d_pow); cudaFree(c->d_spec); cudaFree(c->d_part);
-    cudaFree(c->d_tmin); cudaFree(c->d_tmax); cudaFree(c->d_c);
+    cudaFree(c->d_tmin); cudaFree(c->d_tmax); cudaFree(c->d_tmean); cudaFree(c->d_c);
     cudaStreamDestroy(c->s); free(c);
 }
 

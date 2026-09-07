@@ -671,3 +671,34 @@ fetch flipped the badge straight to "disconnected". Four fixes:
 Also moved `SysMon` off the capture loop: it read /proc/net/wireless
 (~1.5 ms) every frame and shelled out to `iw` (~4 ms) every 5 s, all inline.
 It now samples on its own 1 Hz timer and the loop reads a cached dict.
+
+## 22. Envelope shading, and what a shorted input should read, 2026-09-04
+
+**Shading.** The time-domain plot decimates the whole record into 1024
+columns; the shaded band is min..max of every sample in that column and the
+line through it was (min+max)/2 -- the envelope MIDPOINT, which for
+asymmetric data sits where no sample is. Measured on a deliberately skewed
+test signal, that line was 434 codes away from the true mean. `k_env` now
+also reduces a per-column mean (validated against numpy: max error 0.0000
+codes) and the line draws that. Wire format 3 carries it as uint16 in
+quarter-code units (0.25 code quantisation). The header now states
+"shaded = min..max per column, line = mean".
+
+**"Shorting the input gives much larger values -- is the conversion wrong?"**
+The conversion is almost certainly right, and the observation is evidence
+FOR that rather than against it. The bit extraction is proven by the ramp
+test (section 4: a perfect 0..16383 sawtooth with bits 15:14 always clear).
+What was never established is the code-to-input mapping.
+
+For 14-bit OFFSET BINARY, mid-scale 8192 = zero differential input. Shorting
+the inputs together IS zero differential, so it should read ~8192. A
+floating differential input has no defined common mode and drifts to a rail,
+which is exactly what is seen: ch2 currently reads mean 139.9, i.e. 98.3%
+below mid-scale, hammered against the bottom code. So floating ~140 ->
+shorted ~8192 is the correct behaviour of a correctly decoded offset-binary
+converter, and the jump is ~58x.
+
+If the shorted reading is near 8192 this RESOLVES the open format question
+from section 4 (offset binary vs two's complement) -- record the number. If
+it is near 0 or full scale instead, that would be the anomaly. A new
+"vs mid-scale (8192)" row in the Signal panel makes the comparison direct.
