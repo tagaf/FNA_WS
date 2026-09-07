@@ -184,6 +184,14 @@ measured behaviour and the one open ambiguity.
 Use a low-sidelobe window (`blackman-harris`) for spur hunting; Hann's
 -31.5 dB sidelobes let a strong tone's skirt be detected as spurs.
 
+In the UI, the **Classify** control turns on live labelling: each detected
+family gets a colour, with ticks above the spectrum and dots on the trace at
+its harmonics, and a *Noise sources* card lists the families (fundamental,
+label, harmonic count, density, significance, peak level). Unmatched lines
+are grey. It runs ~1x/s in a worker thread -- measured cost to the capture
+loop is 0% -- and markers are hidden whenever the analysis and the displayed
+frame disagree on fs/nfft/channel.
+
 ## Known constraints (evidence in NOTES.md)
 
 - Max capture 262,144,000 samples (500 MiB window, linear, no wrap) ≈

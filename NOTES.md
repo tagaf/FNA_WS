@@ -413,3 +413,28 @@ so the sieve legitimately locks to f0/2, or (b) the disturbance is periodic
 in sample index rather than time. Not resolved; the tool now reports this as
 AMBIGUOUS rather than claiming either. The termination experiment is the
 unambiguous discriminator and is the next measurement to run.
+
+## 14. Classification wired into the live plot, 2026-09-04
+
+`analyse()` costs 103 / 325 / 557 ms at 2^20 / 2^22 / 2^24 bins, so it cannot
+run in a ~50 fps capture loop. It runs in a dedicated worker thread that
+takes a snapshot only when idle (so work can never queue faster than it
+retires) and at most every `classify_period` (1 s default). EMI sources
+drift slowly; a ~1 Hz classification under a live-rate display is the right
+trade. Measured cost with an interleaved A/B/A/B (needed -- a naive
+before/after showed a bogus 57% because the first sample was warm-up):
+**0.0% of frame rate**.
+
+Frames carry an `analysis` block (families with member frequencies/levels,
+unmatched spurs, floor and CFAR threshold) trimmed to 8 families x 96
+members + 32 spurs, so it never dwarfs the spectrum payload. It is tagged
+with the fs/nfft/channel it was computed from; the UI refuses to draw
+markers when those disagree with the current frame, since an analysis of a
+different spectrum would put ticks at meaningless places.
+
+UI: coloured ticks at the top of the spectrum plus a dot on the trace for
+every family member, one hue per family, grey for unmatched lines, and a
+"Noise sources" card listing each family (f0, label, harmonic count,
+density, significance, peak level). Enabled by the `Classify` control
+(default off).
+

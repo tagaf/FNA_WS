@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ad9643 as A
 import gpu
+import noise
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
@@ -336,6 +337,7 @@ class Engine:
                         nfft=nfft, max_frames=max_frames, avg=avg,
                         trace_samples=-1,     # -1: trace shows the whole record
                                               # (explicit count still accepted)
+                        classify=0,           # 1: run peak/noise classification
                         readback=-1)   # -1 auto, 0 full N, >0 explicit
         self.trace_width = trace_width
         self.min_period = min_period      # floor on loop period; leaves the
@@ -359,6 +361,20 @@ class Engine:
         self._acc_n = 0
         self._acc_tag = None   # (fs, nfft, channel) the accumulator belongs to
 
+        # Classification runs in its own thread: analyse() costs 100-560 ms on
+        # a full-resolution spectrum (measured 2^20..2^24 bins), which would
+        # throttle a ~50 fps capture loop to a crawl. EMI sources drift slowly,
+        # so a ~1 Hz classification against a live-rate display is the right
+        # trade. The worker takes a snapshot only when idle, so it can never
+        # queue up work faster than it retires it.
+        self.analysis = None
+        self.classify_period = 1.0
+        self.pfa = 1e-6
+        self._an_lock = threading.Lock()
+        self._an_cv = threading.Condition(self._an_lock)
+        self._an_req = None
+        self._an_last = 0.0
+
     # ---- lifecycle
     def start(self):
         if self.mock:
@@ -372,6 +388,8 @@ class Engine:
                                trace_width=self.trace_width)
         self.th = threading.Thread(target=self._loop, daemon=True)
         self.th.start()
+        self.an_th = threading.Thread(target=self._analysis_loop, daemon=True)
+        self.an_th.start()
 
     def stop(self):
         self._stop.set()
@@ -380,7 +398,11 @@ class Engine:
         # could still be waiting on join() when the terminal least expects it,
         # inviting an impatient second Ctrl-C mid-shutdown. 20s comfortably
         # covers worst case plus Spectrum teardown of the largest buffers.
+        with self._an_lock:
+            self._an_cv.notify_all()
         self.th.join(timeout=20)
+        if getattr(self, "an_th", None):
+            self.an_th.join(timeout=5)
         self.sp.close(); self.dma.close(); self.adc.close()
 
     def configure(self, **kw):
@@ -431,6 +453,59 @@ class Engine:
                 slack = self.min_period - (time.monotonic() - t0)
                 if slack > 0:
                     time.sleep(slack)
+
+    MAX_WIRE_FAMILIES = 8
+    MAX_WIRE_MEMBERS = 96
+    MAX_WIRE_SPURS = 32
+
+    def _analysis_loop(self):
+        while not self._stop.is_set():
+            with self._an_lock:
+                while self._an_req is None and not self._stop.is_set():
+                    self._an_cv.wait(timeout=0.5)
+                req = self._an_req
+            if req is None:
+                continue
+            try:
+                spec, bin_hz, fs, K, nfft, ch = req
+                r = noise.analyse(spec, bin_hz, fs, nframes=K, pfa=self.pfa)
+                self.analysis = self._shape_analysis(r, fs, nfft, ch)
+            except Exception as e:
+                self.analysis = {"error": f"{type(e).__name__}: {e}"}
+            finally:
+                with self._an_lock:
+                    self._an_req = None
+
+    def _shape_analysis(self, r, fs, nfft, ch):
+        """Trim to what the plot needs -- a full peak list can be thousands
+        of entries and would dwarf the spectrum payload itself."""
+        fams = []
+        for i, f in enumerate(r["families"][:self.MAX_WIRE_FAMILIES]):
+            mem = sorted(f["members"], key=lambda m: -m["db"])[:self.MAX_WIRE_MEMBERS]
+            fams.append({
+                "id": i,
+                "f0_hz": f["f0_hz"],
+                "label": f.get("label", "?"),
+                "why": f.get("why", ""),
+                "n_members": f["n_members"],
+                "density": f["density"],
+                "significance": f.get("significance", 0.0),
+                "peak_db": f["peak_db"],
+                "freqs": [m["freq_hz"] for m in mem],
+                "dbs": [m["db"] for m in mem],
+            })
+        spurs = [p for p in r["peaks"] if p.get("label") not in (None, "family_member")]
+        spurs.sort(key=lambda p: -p["db"])
+        return {
+            "ts": time.time(), "fs_hz": fs, "nfft": nfft, "channel": ch,
+            "floor_db": r["floor_db"],
+            "thr_db": r["threshold_db_over_floor"],
+            "n_peaks": r["n_peaks"],
+            "families": fams,
+            "spurs": [{"freq_hz": p["freq_hz"], "db": p["db"],
+                       "label": p["label"], "why": p.get("why", "")}
+                      for p in spurs[:self.MAX_WIRE_SPURS]],
+        }
 
     def _one(self, cfg):
         t_loop0 = time.monotonic()
@@ -543,6 +618,19 @@ class Engine:
         noise = float(np.median(shown[1::step]))
         gt = self.sp.times
 
+        if cfg.get("classify"):
+            now = time.monotonic()
+            if now - self._an_last >= self.classify_period:
+                with self._an_lock:
+                    if self._an_req is None:          # only when idle
+                        self._an_req = (shown.copy(), bin_hz, fs,
+                                        max(1, self.sp.nframes * max(1, self._acc_n)),
+                                        nfft, ch)
+                        self._an_last = now
+                        self._an_cv.notify()
+        elif self.analysis is not None:
+            self.analysis = None
+
         disp, disp_f0, disp_f1 = log_display(shown, bin_hz, DISP_BINS)
 
         zoom_meta = {"active": False, "bins": 0, "lo_hz": 0.0, "hi_hz": 0.0, "bin_hz": 0.0}
@@ -618,6 +706,7 @@ class Engine:
                 "avg_depth": self._acc_n,
             },
             "sys": self.sysmon.sample(),
+            "analysis": self.analysis,
             "err": self.err,
         }
         hdr = json.dumps(m).encode()
