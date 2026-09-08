@@ -378,6 +378,7 @@ class Engine:
         self.raw = None                 # recent raw samples, for /raw
         self._raw_req = 0.0
         self.dual = None                # per-channel stats when ch_sel=3
+        self._ch_fail = 0               # consecutive timeouts on this channel
         self.classify_period = 1.0
         self.pfa = 1e-6
         self._an_lock = threading.Lock()
@@ -458,6 +459,22 @@ class Engine:
             except (A.CaptureTimeout, A.DmaTimeout) as e:
                 self.timeouts += 1
                 self.err = str(e)
+                # Dual-channel (ch_sel=3) does not complete on this
+                # bitstream: Adc_Finish never asserts, at every record
+                # length, with or without the vendor's doubled count (see
+                # NOTES.md #29). Rather than stall the display half a second
+                # per frame forever, fall back and say why.
+                if cfg.get("channel") == A.CH_BOTH:
+                    self._ch_fail += 1
+                    if self._ch_fail >= 2:
+                        with self.lock:
+                            self.cfg["channel"] = A.CH_A
+                        self._ch_fail = 0
+                        self.err = ("Channel 3 (A+B) never completes on this "
+                                    "bitstream - Adc_Finish stays low at every "
+                                    "record length. Fell back to channel A. "
+                                    "This is an FPGA-side limitation, not a "
+                                    "client bug; see NOTES.md #29.")
                 time.sleep(0.2)
             except Exception as e:
                 self.err = f"{type(e).__name__}: {e}"
@@ -641,7 +658,11 @@ class Engine:
         # arm clears Adc_Finish (it otherwise idles high from the previous run)
         self.adc.wr(A.REG_SPEED, sp_)
         self.adc.wr(A.REG_CHANNEL, ch)
-        self.adc.wr(A.REG_NSAMPLES, N)
+        # In A+B mode every sample clock emits TWO 16-bit words, and the
+        # FPGA's DDR accounting (burst_num = wr_ddr_num/256) is in 16-bit
+        # words -- so the count written must be doubled. The vendor client
+        # does exactly this: fpgaDataNum = depth*2 when ch==3.
+        self.adc.wr(A.REG_NSAMPLES, N * 2 if ch == A.CH_BOTH else N)
         # duration DOES scale with the divider (the FSM counts decimated
         # samples before releasing), even though the DATA is always full rate
         expect = N * (sp_ + 1) / A.BASE_CLOCK_HZ
@@ -745,6 +766,7 @@ class Engine:
             self._acc_n = min(self._acc_n + 1, navg)
         shown = self._acc
 
+        self._ch_fail = 0          # a completed capture clears the streak
         t_loop = time.monotonic() - t_loop0
         self.tot_frames += 1
         self.tot_samples += N
