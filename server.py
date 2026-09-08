@@ -337,7 +337,6 @@ class Engine:
                         trace_samples=-1,     # -1: trace shows the whole record
                                               # (explicit count still accepted)
                         classify=0,           # 1: run peak/noise classification
-                        view_ch=1,            # which channel to display in ch_sel=3
                         pfa_exp=6,            # detection sensitivity: Pfa=1e-N
                         readback=-1)   # -1 auto, 0 full N, >0 explicit
         self.trace_width = trace_width
@@ -376,6 +375,7 @@ class Engine:
         # queue up work faster than it retires it.
         self.analysis = None
         self.raw = None                 # recent raw samples, for /raw
+        self._pending = None            # de-interleaved channels in dual mode
         self._raw_req = 0.0
         self.dual = None                # per-channel stats when ch_sel=3
         self._ch_fail = 0               # consecutive timeouts on this channel
@@ -724,14 +724,13 @@ class Engine:
                              "min": int(A.to_signed(v).min()),
                              "max": int(A.to_signed(v).max())}
                          for k, v in chans.items() if v.size}
-            want = "A" if cfg.get("view_ch", 1) == 1 else "B"
-            view = np.array(chans[want], copy=True)
-            np.copyto(self.sp.stage[:view.size], view)
-            n = view.size
-            self.sp.load(n * 2)
+            # keep both, de-interleaved, so both can be analysed and drawn
+            self._pending = {k: np.array(v, copy=True) for k, v in chans.items()}
+            n = read_n
             got = nbytes
         else:
             self.dual = None
+            self._pending = None
             nbytes = read_n * 2
             n = self.dma.read_into(self.sp.stage, read_n)
             self.sp.load(n * 2)
@@ -740,10 +739,31 @@ class Engine:
             self.raw = np.array(self.sp.stage[:min(n, 1 << 16)], copy=True)
         t_dma = time.monotonic() - t1
 
-        # CUDA
+        # CUDA -- once per trace. Dual mode draws both channels, so both get
+        # analysed; a GPU pass is a few ms, cheaper than making the user pick.
         t2 = time.monotonic()
-        spec = self.sp.process(read_n, max_frames=cfg["max_frames"],
-                               trace_n=trace_n)
+        traces = []
+        if self._pending:
+            for name in ("A", "B"):
+                arr = self._pending[name]
+                np.copyto(self.sp.stage[:arr.size], arr)
+                self.sp.load(arr.size * 2)
+                sp_i = self.sp.process(arr.size, max_frames=cfg["max_frames"],
+                                       trace_n=min(trace_n, arr.size)).copy()
+                traces.append({"name": name, "spec": sp_i,
+                               "tmin": self.sp.tmin.copy(),
+                               "tmax": self.sp.tmax.copy(),
+                               "tmean": self.sp.tmean.copy(),
+                               "stats": self.sp.stats.copy(),
+                               "nframes": int(self.sp.nframes)})
+        else:
+            sp_i = self.sp.process(read_n, max_frames=cfg["max_frames"],
+                                   trace_n=trace_n)
+            traces.append({"name": "", "spec": sp_i,
+                           "tmin": self.sp.tmin, "tmax": self.sp.tmax,
+                           "tmean": self.sp.tmean, "stats": self.sp.stats,
+                           "nframes": int(self.sp.nframes)})
+        spec = traces[0]["spec"]
         t_gpu_wall = time.monotonic() - t2
 
         # exponential spectrum averaging
@@ -754,18 +774,22 @@ class Engine:
         # stale peaks at wrong frequencies (seen: a 6.25 MHz peak from
         # speed=7 displayed as 50 MHz after switching to speed=0). Tag the
         # accumulator with the producing config and reseed on any mismatch.
-        tag = (fs := A.sample_rate(sp_), nfft, ch)
-        if (self._acc is None or self._acc.shape != spec.shape
-                or self._acc_tag != tag):
-            self._acc = spec.copy(); self._acc_n = 1
+        tag = (fs := A.sample_rate(sp_), nfft, ch, len(traces))
+        if (self._acc is None or len(self._acc) != len(traces)
+                or self._acc[0].shape != spec.shape or self._acc_tag != tag):
+            self._acc = [t["spec"].copy() for t in traces]
+            self._acc_n = 1
             self._acc_tag = tag
         elif navg == 1:
-            np.copyto(self._acc, spec); self._acc_n = 1
+            for a_, t in zip(self._acc, traces):
+                np.copyto(a_, t["spec"])
+            self._acc_n = 1
         else:
-            a = np.float32(1.0 / navg)
-            self._acc *= (1 - a); self._acc += a * spec
+            k = np.float32(1.0 / navg)
+            for a_, t in zip(self._acc, traces):
+                a_ *= (1 - k); a_ += k * t["spec"]
             self._acc_n = min(self._acc_n + 1, navg)
-        shown = self._acc
+        shown = self._acc[0]
 
         self._ch_fail = 0          # a completed capture clears the streak
         t_loop = time.monotonic() - t_loop0
@@ -803,6 +827,10 @@ class Engine:
             self.analysis = None
 
         disp, disp_f0, disp_f1 = log_display(shown, bin_hz, DISP_BINS)
+        # one display-decimated spectrum per trace; trace 0 is `shown`, the
+        # EMA-averaged one that peaks and classification are taken from
+        disps = [disp] + [log_display(self._acc[i], bin_hz, DISP_BINS)[0]
+                          for i in range(1, len(traces))]
 
         zoom_meta = {"active": False, "bins": 0, "lo_hz": 0.0, "hi_hz": 0.0, "bin_hz": 0.0}
         zoom_bytes = b""
@@ -831,6 +859,8 @@ class Engine:
             "disp_f1": disp_f1,
             "zoom": zoom_meta,
             "trace_width": int(self.trace_width),
+            "traces": [t["name"] for t in traces],
+            "n_traces": len(traces),
             "nframes": int(self.sp.nframes),
             "bin_hz": bin_hz,
             "acq": {
@@ -887,22 +917,25 @@ class Engine:
         # envelope as uint16, which is EXACT because those are 14-bit ADC
         # codes. 26.5 kB/frame at 66 fps is 14 Mbit/s on a 7 Mbit/s link;
         # this brings it to ~3.4 Mbit/s at 30 fps.
-        m["wire"] = 4          # envelope is SIGNED 14-bit now
+        m["wire"] = 5          # per-trace array groups
         m["tmean_scale"] = 4.0
         m["volt_scale"] = A.VOLT_SCALE
         m["disp_scale"] = 100.0
         hdr = json.dumps(m).encode()
-        d16 = np.clip(disp, -320.0, 40.0).astype(np.float32) * 100.0
         z16 = (np.clip(np.frombuffer(zoom_bytes, dtype=np.float32),
                        -320.0, 40.0) * 100.0).astype(np.int16) \
               if zoom_bytes else np.zeros(0, np.int16)
-        blob = (struct.pack("<I", len(hdr)) + hdr +
-                d16.astype(np.int16).tobytes() + z16.tobytes() +
-                np.clip(self.sp.tmin, -32768, 32767).astype(np.int16).tobytes() +
-                np.clip(self.sp.tmax, -32768, 32767).astype(np.int16).tobytes() +
-                # mean carries fractional codes, so send quarter-code units
-                # (+-8192 codes * 4 still fits int16)
-                np.clip(self.sp.tmean * 4.0, -32768, 32767).astype(np.int16).tobytes())
+        i16 = lambda a: np.clip(a, -32768, 32767).astype(np.int16).tobytes()
+        # layout: per trace -> disp, [zoom, on trace 0 only], tmin, tmax,
+        # tmean. The zoom slice is a crop of the primary spectrum, so it goes
+        # once rather than per trace.
+        parts = [struct.pack("<I", len(hdr)), hdr]
+        for i, t in enumerate(traces):
+            parts.append(i16(np.clip(disps[i], -320.0, 40.0) * 100.0))
+            if i == 0:
+                parts.append(z16.tobytes())
+            parts += [i16(t["tmin"]), i16(t["tmax"]), i16(t["tmean"] * 4.0)]
+        blob = b"".join(parts)
         with self.new_frame:
             self.frame = blob
             self.new_frame.notify_all()   # wake every long-poll waiter

@@ -1067,3 +1067,26 @@ include order). Found by running it:
 The C2H path deliberately replicates `dma_from_device` (O_RDWR|O_TRUNC,
 posix_memalign(4096), chunked lseek+read) because a naive `read()` there has
 hard-frozen this machine before (section 5).
+
+## 32. Dual channel draws BOTH traces, 2026-09-08
+
+The "Show" selector is gone. With Channel = 3 the server now runs the CUDA
+pass once per channel and ships both, and the UI draws them together in both
+plots, one colour per channel (A green, B blue) with a legend chip in each
+card header.
+
+Wire format 5: the payload is one array group per trace --
+`disp, [zoom on trace 0 only], tmin, tmax, tmean` -- with `n_traces` and
+`traces` in the header. The zoom slice is a crop of the primary spectrum so
+it is sent once, not per trace. Layout verified byte-exact for single, dual,
+and dual+zoom.
+
+Costs: two GPU passes per frame instead of one (a few ms each), and roughly
+double the payload, but only in dual mode. Measured on hardware at
+N=1,048,576 / nfft 8192 / 16 Welch frames: 10.5 fps, zero timeouts, trace A
+mean -15.43 codes and trace B -62.93, matching single-channel captures of
+the same inputs.
+
+The EMA accumulator is now per trace. Peaks, the noise classifier and the
+signal panel still read trace 0 (channel A) -- the spectrum analysis is
+single-source by design; the second trace is drawn, not analysed.

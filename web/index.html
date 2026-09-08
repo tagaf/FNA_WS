@@ -151,8 +151,6 @@ tr:last-child td{border-bottom:0}
             <option value="3">3 — A + B simultaneously</option>
             <option value="0">0 — internal test ramp (FPGA counter)</option>
           </select>
-          <label>Show</label>
-          <select id="view_ch" title="Which channel to plot when Channel = 3. Both are captured over the same time window; this only picks the one displayed."></select>
           <label>Samples</label>
           <select id="nsamples"></select>
           <label title="Does NOT change the sample rate. It gates only the capture FSM's sample counter, so the data is always 250 Msps and the capture just takes (n+1) times longer. Leave at 0.">Capture stretch</label>
@@ -279,7 +277,6 @@ opts($('speed'),[0,1,3,7,15,31,63,255],
      v=>v===0?'0 — normal':`${v} — ${v+1}× slower capture, same 250 Msps`,0);
 opts($('avg'),[1,2,4,8,16,32],v=>v==1?'1 (off)':v+'\u00d7 EMA',4);
 opts($('classify'),[0,1],v=>v?'on — label noise sources':'off',0);
-opts($('view_ch'),[1,2],v=>v===1?'ADC A':'ADC B',1);
 opts($('persist'),[0,0.5,2,10,-1],
      v=>({0:'off',0.5:'0.5 s',2:'2 s',10:'10 s','-1':'hold'})[v],0);
 opts($('pfa_exp'),[2,3,4,6,9],
@@ -289,7 +286,7 @@ opts($('max_frames'),[1,2,4,8,16,32,64,128,256],v=>v==1?'1 (single FFT)':v+'\u00
 function fmtDur(sec){const [k,u]=axTimeUnit(sec);return axNum(sec*k)+' '+u}
 
 // ---- pending/applied confirmation for control changes
-const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames','classify','pfa_exp','view_ch'];
+const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames','classify','pfa_exp'];
 const pending={};
 function markPending(id){
   pending[id]=$(id).value;
@@ -379,11 +376,11 @@ function logTicks(lo,hi){
   return out.length>=2?out:[lo,hi];
 }
 
-function drawTime(m,tmin,tmax,tmean){
+function drawTime(m,T){
   const {c,w,h}=setup($('cTime'));
-  const n=tmin.length;
+  const n=T[0].tmin.length;
   let lo=Infinity,hi=-Infinity;
-  for(let i=0;i<n;i++){if(tmin[i]<lo)lo=tmin[i];if(tmax[i]>hi)hi=tmax[i]}
+  for(const t of T)for(let i=0;i<n;i++){if(t.tmin[i]<lo)lo=t.tmin[i];if(t.tmax[i]>hi)hi=t.tmax[i]}
   if(!isFinite(lo)){lo=0;hi=16383}
   const pad=Math.max(4,(hi-lo)*0.08);lo-=pad;hi+=pad;
   // keep tracking the live range even while locked, so unlocking resumes
@@ -400,21 +397,24 @@ function drawTime(m,tmin,tmax,tmean){
     return {p,l:Math.abs(v)>=1000?(v/1000).toFixed(2)+'V':v.toFixed(Math.abs(v)<10?2:1)};});
   const g=axes(c,w,h,xt,yt);
   const Y=v=>g.y0+g.ph*(1-(v-lo)/(hi-lo));
-  // envelope band
-  c.beginPath();
-  for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1);i?c.lineTo(x,Y(tmax[i])):c.moveTo(x,Y(tmax[i]))}
-  for(let i=n-1;i>=0;i--){const x=g.x0+g.pw*i/(n-1);c.lineTo(x,Y(tmin[i]))}
-  c.closePath();c.fillStyle='rgba(126,231,135,.22)';c.fill();
-  c.strokeStyle='#7ee787';c.lineWidth=1;
-  c.beginPath();
-  for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1);
-    // true per-column mean, not (min+max)/2 -- the envelope midpoint sits
-    // where no sample necessarily is once the signal is asymmetric
-    const y=Y(tmean?tmean[i]:(tmin[i]+tmax[i])/2);
-    i?c.lineTo(x,y):c.moveTo(x,y)}
-  c.stroke();
-  $('tdInfo').textContent=`${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu}`
-    + ` · shaded = min…max per column, line = mean`
+  // one envelope band + mean line per trace, in that trace's colour
+  T.forEach((t,k)=>{
+    c.beginPath();
+    for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1);i?c.lineTo(x,Y(t.tmax[i])):c.moveTo(x,Y(t.tmax[i]))}
+    for(let i=n-1;i>=0;i--){const x=g.x0+g.pw*i/(n-1);c.lineTo(x,Y(t.tmin[i]))}
+    c.closePath();c.fillStyle=TRACE_FILL[k%TRACE_FILL.length];c.fill();
+    c.strokeStyle=TRACE_COLORS[k%TRACE_COLORS.length];c.lineWidth=1;
+    c.beginPath();
+    for(let i=0;i<n;i++){const x=g.x0+g.pw*i/(n-1);
+      // true per-column mean, not (min+max)/2 -- the envelope midpoint sits
+      // where no sample necessarily is once the signal is asymmetric
+      const y=Y(t.tmean?t.tmean[i]:(t.tmin[i]+t.tmax[i])/2);
+      i?c.lineTo(x,y):c.moveTo(x,y)}
+    c.stroke();
+  });
+  $('tdInfo').innerHTML=traceLegend(T)
+    + `${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu}`
+    + ` · shaded = min…max, line = mean`
     + (tLock?` · full scale ±1.75 V`:' · autoscaled') + ' · mV';
 }
 
@@ -511,8 +511,29 @@ function persistDraw(c,g,pts,pxN,Y,m,fLo,fHi,lo,hi){
   c.drawImage(pCanvas,g.x0,g.y0);
 }
 
+// max-pool a spectrum onto plot pixels; shared so every trace maps identically
+function perPixel(spec,pxN,fromP,binHz,base,n,zoomed){
+  const pts=new Array(pxN);
+  for(let px=0;px<pxN;px++){
+    let i0,i1;
+    if(zoomed){       // linear full-res slice: map pixel->freq->bin index
+      const f0=fromP(px/pxN),f1=fromP((px+1)/pxN);
+      i0=Math.max(0,Math.round((f0-base)/binHz));
+      i1=Math.min(n-1,Math.max(i0,Math.round((f1-base)/binHz)));
+    }else{            // log-spaced points are uniform along the log axis
+      i0=Math.floor(n*px/pxN);
+      i1=Math.min(n-1,Math.max(i0,Math.floor(n*(px+1)/pxN)-1));
+    }
+    let v=-1e9;
+    for(let j=i0;j<=i1;j++) if(spec[j]>v) v=spec[j];
+    pts[px]=(v===-1e9)?spec[Math.min(n-1,Math.max(0,i0))]:v;
+  }
+  return pts;
+}
+
 let freqAxis=null;   // latest {x0,pw,fromP} so drag-select can invert pixel->Hz
-function drawFreq(m,dispSpec,zoomSpec){
+function drawFreq(m,T,zoomSpec){
+  const dispSpec=T[0].spec;
   const {c,w,h}=setup($('cFreq'));
   const fmax=m.fs_hz/2;
   const zoomed=!!(m.zoom&&m.zoom.active&&zoomSpec&&zoomSpec.length>1);
@@ -561,21 +582,7 @@ function drawFreq(m,dispSpec,zoomSpec){
   freqAxis={x0:g.x0,pw:g.pw,fromP};
 
   const pxN=Math.max(1,Math.floor(g.pw));
-  const pts=new Array(pxN);
-  for(let px=0;px<pxN;px++){
-    let i0,i1;
-    if(zoomed){       // linear full-res slice: map pixel->freq->bin index
-      const f0=fromP(px/pxN),f1=fromP((px+1)/pxN);
-      i0=Math.max(0,Math.round((f0-base)/binHz));
-      i1=Math.min(n-1,Math.max(i0,Math.round((f1-base)/binHz)));
-    }else{            // log-spaced points are uniform along the log axis
-      i0=Math.floor(n*px/pxN);
-      i1=Math.min(n-1,Math.max(i0,Math.floor(n*(px+1)/pxN)-1));
-    }
-    let v=-1e9;
-    for(let j=i0;j<=i1;j++) if(spec[j]>v) v=spec[j];
-    pts[px]=(v===-1e9)?spec[Math.min(n-1,Math.max(0,i0))]:v;
-  }
+  const pts=perPixel(spec,pxN,fromP,binHz,base,n,zoomed);
   if(persistTau!==0){
     persistDraw(c,g,pts,pxN,Y,m,fLo,fHi,lo,hi);
     // faint live trace over the density so "now" is still identifiable
@@ -583,14 +590,25 @@ function drawFreq(m,dispSpec,zoomSpec){
     for(let px=0;px<pxN;px++){const y=Y(pts[px]);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y)}
     c.strokeStyle='rgba(230,245,255,.5)';c.lineWidth=1;c.stroke();
   }else{
-    const grad=c.createLinearGradient(0,g.y0,0,g.y0+g.ph);
-    grad.addColorStop(0,'rgba(53,214,195,.35)');grad.addColorStop(1,'rgba(53,214,195,0)');
-    c.beginPath();c.moveTo(g.x0,g.y0+g.ph);
-    for(let px=0;px<pxN;px++)c.lineTo(g.x0+px,Y(pts[px]));
-    c.lineTo(g.x0+pxN,g.y0+g.ph);c.closePath();c.fillStyle=grad;c.fill();
-    c.beginPath();
-    for(let px=0;px<pxN;px++){const y=Y(pts[px]);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y)}
-    c.strokeStyle=zoomed?'#f0a35e':'#35d6c3';c.lineWidth=1;c.stroke();
+    const multi=(!zoomed&&T.length>1);
+    if(!multi){
+      const grad=c.createLinearGradient(0,g.y0,0,g.y0+g.ph);
+      grad.addColorStop(0,'rgba(53,214,195,.35)');grad.addColorStop(1,'rgba(53,214,195,0)');
+      c.beginPath();c.moveTo(g.x0,g.y0+g.ph);
+      for(let px=0;px<pxN;px++)c.lineTo(g.x0+px,Y(pts[px]));
+      c.lineTo(g.x0+pxN,g.y0+g.ph);c.closePath();c.fillStyle=grad;c.fill();
+      c.beginPath();
+      for(let px=0;px<pxN;px++){const y=Y(pts[px]);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y)}
+      c.strokeStyle=zoomed?'#f0a35e':'#35d6c3';c.lineWidth=1;c.stroke();
+    }else{
+      // dual: no fill (two filled bands would hide each other), just lines
+      T.forEach((t,k)=>{
+        const p=perPixel(t.spec,pxN,fromP,binHz,base,n,zoomed);
+        c.beginPath();
+        for(let px=0;px<pxN;px++){const y=Y(p[px]);px?c.lineTo(g.x0+px,y):c.moveTo(g.x0+px,y)}
+        c.strokeStyle=TRACE_COLORS[k%TRACE_COLORS.length];c.lineWidth=1;c.stroke();
+      });
+    }
   }
   // peak marker
   if(m.sig.peak_hz>=fLo&&m.sig.peak_hz<=fHi){
@@ -600,9 +618,9 @@ function drawFreq(m,dispSpec,zoomSpec){
     c.fillStyle='#f0a35e';c.beginPath();c.arc(x,y,3,0,7);c.fill();
     c.textAlign=x>w*.7?'right':'left';c.font='10px ui-monospace,monospace';
     c.fillText(`${eng(m.sig.peak_hz)}  ${f(m.sig.peak_db,1)} dBFS`,x+(x>w*.7?-6:6),g.y0+12)}
-  $('fdInfo').textContent=zoomed
+  $('fdInfo').innerHTML=zoomed
     ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · ${useLog?'log':'linear'}`
-    :`${persistTau?(persistTau<0?'HOLD · ':'PERSIST '+persistTau+'s · '):''}${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
+    :traceLegend(T)+`${persistTau?(persistTau<0?'HOLD · ':'PERSIST '+persistTau+'s · '):''}${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
   drawThreshold(m,g,Y,pxN);
   drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN);
   $('bZoomReset').style.display=zoomed?'':'none';
@@ -812,10 +830,19 @@ function syncControlsFromServer(m){
   if($('nsamples').value)buildNfftOpts(+$('nsamples').value);
 }
 
-function render(m,dispSpec,zoomSpec,tmin,tmax,tmean){
+// one colour per trace, used in BOTH plots so a channel is identifiable
+const TRACE_COLORS=['#7ee787','#5ea8f0'];
+// coloured chips so the two channels can be told apart at a glance
+function traceLegend(T){
+  if(!T||T.length<2)return '';
+  return T.map((t,k)=>`<span style="color:${TRACE_COLORS[k%TRACE_COLORS.length]}">`
+      +`\u25cf ${t.name||('t'+k)}</span>`).join(' ')+' · ';
+}
+const TRACE_FILL=['rgba(126,231,135,.20)','rgba(94,168,240,.18)'];
+function render(m,T,zoomSpec){
   if(m.volt_scale)VOLT_SCALE=m.volt_scale;
   syncControlsFromServer(m);
-  drawTime(m,tmin,tmax,tmean);drawFreq(m,dispSpec,zoomSpec);drawBudget(m.acq);
+  drawTime(m,T);drawFreq(m,T,zoomSpec);drawBudget(m.acq);
   renderNoise(m);checkApplied(m);
   const a=m.acq,g=m.gpu,s=m.sig,y=m.sys,t=m.totals;
   const cov=a.coverage_pct;
@@ -949,26 +976,20 @@ async function poll(){
         // wire 2: spectrum as int16 hundredths of a dB, envelope as uint16
         // ADC codes (exact). Halves the payload on a link that cannot carry
         // the engine's full frame rate anyway.
-        const sc=m.disp_scale||100;
-        const i16=(n)=>{const a=new Int16Array(buf.slice(off,off+n*2));off+=n*2;
+        const sc=m.disp_scale||100, ms=m.tmean_scale||4;
+        const i16=(n,d)=>{const a=new Int16Array(buf.slice(off,off+n*2));off+=n*2;
                         const o=new Float32Array(n);
-                        for(let i=0;i<n;i++)o[i]=a[i]/sc;return o};
-        const s16=(n)=>{const a=new Int16Array(buf.slice(off,off+n*2));off+=n*2;
-                        const o=new Float32Array(n);
-                        for(let i=0;i<n;i++)o[i]=a[i];return o};
-        const dispSpec=i16(m.disp_bins);
+                        for(let i=0;i<n;i++)o[i]=a[i]/d;return o};
+        // wire 5: one array group per trace -- disp, [zoom on trace 0], tmin,
+        // tmax, tmean. Dual-channel sends two groups so both can be drawn.
+        const nTr=Math.max(1,m.n_traces||1), tw=m.trace_width;
+        const T=[];
         let zoomSpec=null;
-        if(m.zoom&&m.zoom.active&&m.zoom.bins>0)zoomSpec=i16(m.zoom.bins);
-        const tw=m.trace_width;
-        const tmin=s16(tw), tmax=s16(tw);
-        // wire 3 adds the per-column MEAN (quarter-code units). An older
-        // server stops after tmax, so fall back to the envelope midpoint.
-        let tmean=null;
-        if((m.wire||2)>=3&&off+tw*2<=buf.byteLength){
-          const ms=m.tmean_scale||4;
-          const a=new Int16Array(buf.slice(off,off+tw*2));off+=tw*2;
-          tmean=new Float32Array(tw);
-          for(let i=0;i<tw;i++)tmean[i]=a[i]/ms;
+        for(let k=0;k<nTr;k++){
+          const spec=i16(m.disp_bins,sc);
+          if(k===0&&m.zoom&&m.zoom.active&&m.zoom.bins>0)zoomSpec=i16(m.zoom.bins,sc);
+          const tmin=i16(tw,1), tmax=i16(tw,1), tmean=i16(tw,ms);
+          T.push({name:(m.traces&&m.traces[k])||'',spec,tmin,tmax,tmean});
         }
         const lag=Math.max(0,(performance.now()-t0)-m.acq.loop_ms);
         netLag=netLag?netLag*0.75+lag*0.25:lag;
@@ -978,7 +999,7 @@ async function poll(){
         if(singlePending && (lastFrames>singleBaseline)){
           singlePending=false;$('bSingle').disabled=false;$('bSingle').textContent='⚡ Single';
         }
-        render(m,dispSpec,zoomSpec,tmin,tmax,tmean);
+        render(m,T,zoomSpec);
         flashDot();
       }else if(r.status===204||r.status===503){
         // nothing new inside the window (paused engine, or an error is
