@@ -1014,3 +1014,56 @@ and `burst_cnt` live during a ch_sel=3 capture.
 Client side: selecting channel 3 now falls back to channel A after two
 consecutive timeouts with an explanatory message, instead of stalling the
 display half a second per frame indefinitely.
+
+## 30. Dual channel DOES work -- Adc_Finish is what is broken, 2026-09-08
+
+Section 29 concluded ch_sel=3 was unusable. That was wrong in an important
+way, found by porting the vendor client to Linux and running its exact
+sequence (`~/pcie_client_sw/linux`).
+
+**`Adc_Finish` never asserts in dual-channel mode -- at any depth from 4096
+to 262144 -- but the capture itself is completely fine.** Blind-waiting the
+expected time and reading gives data that matches single-channel captures of
+the same inputs, and differs run to run (so it is fresh, not stale):
+
+    ch A alone            -15.54 codes, std 6.87
+    ch B alone            -62.13 codes, std 4.12
+    ch3 blind, de-interleaved:
+      A                   -15.40 codes, std 6.87
+      B                   -62.11 codes, std 4.15
+
+This also confirms the interleave order from section 27: `raw[2i]` is A,
+`raw[2i+1]` is B. The vendor works around the same defect -- their client
+skips the Adc_Finish poll in this mode and sleeps instead.
+
+`server.py` now blind-waits for ch_sel=3 (`max(0.02, expect*4 + 0.02)`) and
+writes the doubled sample count. Verified through the server at N = 65536,
+262144 and 1048576: correct per-channel statistics, zero timeouts, 36/26/11
+fps respectively.
+
+So the earlier "FPGA-side limitation" framing was half right: the *completion
+flag* is broken in this mode (and the design does miss timing on exactly that
+logic, section 29), but the data path is sound and the mode is usable.
+
+## 31. Porting the vendor client -- three Linux-specific defects
+
+`~/pcie_client_sw/linux` replaces only the Windows driver layer; every vendor
+source stays byte-identical (the Linux `pcie_xdma.h` shadows theirs via
+include order). Found by running it:
+
+1. `lseek` on `/dev/xdma0_user` fails with **ESPIPE** -- the register node is
+   not seekable, so BAR access needs `pread`/`pwrite`. The DMA nodes are
+   seekable and keep the chunked loop.
+2. A **12-byte register write lands only the first word**. The vendor writes
+   Speed/Channel/SampleNum in one call; on Linux the driver services one
+   32-bit register per call, so Channel_Set and set_sample_num silently kept
+   their old values -- every channel returned channel A's data.
+   `xdma_node_write` now splits into word accesses.
+3. `start_sample` is edge triggered and the vendor only writes 1, relying on
+   a trailing 0 from the previous capture. With it already high there is no
+   edge, `Adc_Finish` idles high so the poll returns instantly, and stale DDR
+   reads look like a successful capture.
+
+The C2H path deliberately replicates `dma_from_device` (O_RDWR|O_TRUNC,
+posix_memalign(4096), chunked lseek+read) because a naive `read()` there has
+hard-frozen this machine before (section 5).

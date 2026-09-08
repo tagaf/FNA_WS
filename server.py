@@ -464,17 +464,6 @@ class Engine:
                 # length, with or without the vendor's doubled count (see
                 # NOTES.md #29). Rather than stall the display half a second
                 # per frame forever, fall back and say why.
-                if cfg.get("channel") == A.CH_BOTH:
-                    self._ch_fail += 1
-                    if self._ch_fail >= 2:
-                        with self.lock:
-                            self.cfg["channel"] = A.CH_A
-                        self._ch_fail = 0
-                        self.err = ("Channel 3 (A+B) never completes on this "
-                                    "bitstream - Adc_Finish stays low at every "
-                                    "record length. Fell back to channel A. "
-                                    "This is an FPGA-side limitation, not a "
-                                    "client bug; see NOTES.md #29.")
                 time.sleep(0.2)
             except Exception as e:
                 self.err = f"{type(e).__name__}: {e}"
@@ -670,19 +659,31 @@ class Engine:
         t0 = time.monotonic()
         self.adc.wr(A.REG_START, 0)
         self.adc.wr(A.REG_START, 1)
-        while not self.adc.finished:
-            if time.monotonic() - t0 > timeout:
-                st = self.adc.regs(); self.adc.recover()
-                raise A.CaptureTimeout(f"Adc_Finish low after {timeout:.3f}s regs={st}")
-            time.sleep(1e-4)          # never busy-spin on MMIO reads
-        t_cap = time.monotonic() - t0
+        if ch == A.CH_BOTH:
+            # Adc_Finish NEVER asserts in dual-channel mode -- verified at
+            # every depth from 4096 to 262144 -- yet the capture itself is
+            # fine: blind-waiting yields data that matches single-channel
+            # captures of the same inputs and differs run to run. The vendor
+            # client works around it the same way (it skips the poll in this
+            # mode and sleeps instead). See NOTES.md #30.
+            time.sleep(max(0.02, expect * 4 + 0.02))
+            t_cap = time.monotonic() - t0
+            suspect = False
+        else:
+            while not self.adc.finished:
+                if time.monotonic() - t0 > timeout:
+                    st = self.adc.regs(); self.adc.recover()
+                    raise A.CaptureTimeout(f"Adc_Finish low after {timeout:.3f}s regs={st}")
+                time.sleep(1e-4)      # never busy-spin on MMIO reads
+            t_cap = time.monotonic() - t0
 
         # Physics check. The FSM cannot digitise N samples faster than N/fs,
         # so a completion far short of that means Adc_Finish was still high
         # from the previous run (it idles high — see NOTES.md) and we are
         # about to read a buffer that was never filled. Flag it rather than
         # publishing a plausible-looking spectrum built from stale DDR.
-        suspect = t_cap < 0.5 * expect
+        if ch != A.CH_BOTH:
+            suspect = t_cap < 0.5 * expect
 
         # Read back only what is actually consumed. The spectrum uses exactly
         # max_frames*nfft samples and the trace is decimated to trace_width
@@ -724,7 +725,7 @@ class Engine:
                              "max": int(A.to_signed(v).max())}
                          for k, v in chans.items() if v.size}
             want = "A" if cfg.get("view_ch", 1) == 1 else "B"
-            view = np.array(chans.get(want, first), copy=True)
+            view = np.array(chans[want], copy=True)
             np.copyto(self.sp.stage[:view.size], view)
             n = view.size
             self.sp.load(n * 2)
