@@ -893,3 +893,66 @@ envelope columns; channel B: none). Railing is consistent with the input
 being outside the converter's common-mode range -- a 50 ohm SMA termination
 to ground gives 0 V common mode with no front end to bias it -- and rules
 the current data unusable as a measurement either way.
+
+## 27. THE DATA IS SIGNED. Vendor client received 2026-09-08
+
+`~/pcie_client_sw` (Puzhi's Qt client, Windows-only) settles the format
+question that has been open since the first handoff -- and shows that every
+statistic this tool has reported was misinterpreted.
+
+    #define ADC_FS_VOLTAGE   1.75
+    #define ADC_MAX_CODE     8192.0
+    #define VOLT_SCALE       (ADC_FS_VOLTAGE / ADC_MAX_CODE)
+    int16_t a = ((int16_t)(raw[ri*2]   << 2)) >> 2;
+    int16_t b = ((int16_t)(raw[ri*2+1] << 2)) >> 2;
+
+`((int16_t)(x<<2))>>2` is a 14-bit **two's complement** sign extension. So:
+
+* codes are SIGNED, -8192..+8191, not unsigned 0..16383
+* full scale is +-1.75 V, i.e. **213.6 uV per code**
+* in dual mode `raw[2i]` is channel **A**, `raw[2i+1]` is channel **B**
+  (the opposite of what section 26.3 guessed from bit order)
+
+Re-reading the terminated measurements with the correct sign:
+
+    ch1(A) mean 16126.5 unsigned  ->   -258 codes  =  -55.1 mV
+    ch2(B) mean 16321.6 unsigned  ->    -63 codes  =  -13.5 mV
+    floating           186        ->   +186 codes  =  +39.7 mV
+
+Nothing was railed. Both terminated channels sit tens of millivolts from
+zero, which is what a terminated input should do. And the "spikes to 0" that
+prompted this: unsigned 16383 is signed -1 and unsigned 0 is 0, so a signal
+dithering either side of zero renders as violent jumps between the two rails
+when read as unsigned. Channel A showed it far more than B simply because A
+sat closer to zero (-55 mV with 1973 codes of apparent spread vs B's tight
+16). It was a display artifact of the wrong sign convention, not hardware.
+
+This also invalidates spectra taken since the terminations went on: the
+wraparound injects huge discontinuities. Floating-input spectra (section 22
+and earlier) were unaffected -- those codes were all small and positive, so
+they never wrapped.
+
+Fixed everywhere: `s14()` in the CUDA stats/window/envelope kernels
+(validated -- data that read mean 7097/std 8116 as unsigned now recovers
+mean +0.007/std 3.014, matching the truth), `ad9643.to_signed()/to_volts()`,
+wire format 4 with a signed int16 envelope, and the time-domain axis now
+reads millivolts rather than raw codes.
+
+## 28. Can the vendor client run on the AGX? No.
+
+`pcie_client_sw` is Windows-only:
+
+* `xdma_public.h` includes `<Windows.h>`
+* `pcie_xdma.cpp` uses SetupAPI (7 `SetupDi*` calls) to enumerate the driver
+  by interface GUID, then `CreateFile`/`HANDLE`/`CloseHandle` (12 uses)
+* the .pro links `-lopengl32 -lglu32`, plus `RC_ICONS`, a `.rc` resource and
+  a C# launcher
+
+Porting is nevertheless small: **only `pcie_xdma.cpp` (157 lines) is
+OS-specific**, and its whole interface is four functions
+(`xdma_node_open/read/write/close`) which map onto Linux `open`/`pread`/
+`pwrite`/`close` on `/dev/xdma0_*` -- exactly what `ad9643.py` already does.
+Qt and QCustomPlot are portable; Qt is not installed here
+(`apt install qtbase5-dev`, 5.15 available). Not worth doing for its own
+sake -- this repo's client already does more -- but the source is the
+authority on register semantics and data format, as section 27 shows.

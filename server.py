@@ -695,11 +695,12 @@ class Engine:
             nbytes = read_n * 4
             n = self.dma.read_into(self.sp.stage, read_n * 2)
             raw = self.sp.stage[:n]
-            first, second = raw[0::2], raw[1::2]
-            lab = A.BOTH_INTERLEAVE
-            chans = {lab[0]: first, lab[1]: second}
-            self.dual = {k: {"mean": float(v.mean()), "std": float(v.std()),
-                             "min": int(v.min()), "max": int(v.max())}
+            # vendor client: raw[2i] is channel A, raw[2i+1] is channel B
+            chans = {"A": raw[0::2], "B": raw[1::2]}
+            self.dual = {k: {"mean": float(A.to_signed(v).mean()),
+                             "std": float(A.to_signed(v).std()),
+                             "min": int(A.to_signed(v).min()),
+                             "max": int(A.to_signed(v).max())}
                          for k, v in chans.items() if v.size}
             want = "A" if cfg.get("view_ch", 1) == 1 else "B"
             view = np.array(chans.get(want, first), copy=True)
@@ -863,8 +864,9 @@ class Engine:
         # envelope as uint16, which is EXACT because those are 14-bit ADC
         # codes. 26.5 kB/frame at 66 fps is 14 Mbit/s on a 7 Mbit/s link;
         # this brings it to ~3.4 Mbit/s at 30 fps.
-        m["wire"] = 3
+        m["wire"] = 4          # envelope is SIGNED 14-bit now
         m["tmean_scale"] = 4.0
+        m["volt_scale"] = A.VOLT_SCALE
         m["disp_scale"] = 100.0
         hdr = json.dumps(m).encode()
         d16 = np.clip(disp, -320.0, 40.0).astype(np.float32) * 100.0
@@ -873,10 +875,11 @@ class Engine:
               if zoom_bytes else np.zeros(0, np.int16)
         blob = (struct.pack("<I", len(hdr)) + hdr +
                 d16.astype(np.int16).tobytes() + z16.tobytes() +
-                np.clip(self.sp.tmin, 0, 65535).astype(np.uint16).tobytes() +
-                np.clip(self.sp.tmax, 0, 65535).astype(np.uint16).tobytes() +
+                np.clip(self.sp.tmin, -32768, 32767).astype(np.int16).tobytes() +
+                np.clip(self.sp.tmax, -32768, 32767).astype(np.int16).tobytes() +
                 # mean carries fractional codes, so send quarter-code units
-                np.clip(self.sp.tmean * 4.0, 0, 65535).astype(np.uint16).tobytes())
+                # (+-8192 codes * 4 still fits int16)
+                np.clip(self.sp.tmean * 4.0, -32768, 32767).astype(np.int16).tobytes())
         with self.new_frame:
             self.frame = blob
             self.new_frame.notify_all()   # wake every long-poll waiter

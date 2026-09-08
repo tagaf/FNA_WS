@@ -8,7 +8,17 @@
 #include <stdio.h>
 #include <math.h>
 
-#define FS_CODES 8192.0f          // 14-bit half-scale
+#define FS_CODES 8192.0f          // 14-bit full-scale amplitude
+
+// The converter delivers 14-bit TWO'S COMPLEMENT, right-aligned in a 16-bit
+// word -- confirmed by the vendor's own client, which sign-extends with
+// ((int16_t)(x<<2))>>2 and scales by 1.75 V / 8192. Reading it as unsigned
+// makes a signal sitting near zero jump between ~0 and ~16383 whenever it
+// crosses zero, which looks like violent spikes and wrecks the spectrum.
+__device__ __forceinline__ float s14(unsigned short v){
+    int i = (int)v;
+    return (float)((i ^ 0x2000) - 0x2000);
+}
 #define MAXB 256
 
 struct FftCtx {
@@ -66,7 +76,7 @@ __global__ void k_stats(const unsigned short*x,int n,float*part){
     __shared__ float ss[MAXB],sq[MAXB],mn[MAXB],mx[MAXB];
     int t=threadIdx.x, i=blockIdx.x*blockDim.x+t, st=gridDim.x*blockDim.x;
     float s=0,q=0,a=1e30f,b=-1e30f;
-    for(int j=i;j<n;j+=st){ float v=(float)x[j]; s+=v; q+=v*v; a=fminf(a,v); b=fmaxf(b,v); }
+    for(int j=i;j<n;j+=st){ float v=s14(x[j]); s+=v; q+=v*v; a=fminf(a,v); b=fmaxf(b,v); }
     ss[t]=s; sq[t]=q; mn[t]=a; mx[t]=b; __syncthreads();
     for(int d=blockDim.x/2; d>0; d>>=1){
         if(t<d){ ss[t]+=ss[t+d]; sq[t]+=sq[t+d];
@@ -88,7 +98,7 @@ __global__ void k_stats_fin(float*part,int nb,float*out,int n){
 __global__ void k_win(const unsigned short*x,float*y,const float*w,
                       int nfft,int frames,const float*stats){
     int i=blockIdx.x*blockDim.x+threadIdx.x, tot=nfft*frames;
-    if(i<tot) y[i]=((float)x[i]-stats[2])*w[i%nfft];   // stats[2] = mean
+    if(i<tot) y[i]=(s14(x[i])-stats[2])*w[i%nfft];   // stats[2] = mean
 }
 
 // average |X|^2 across frames
@@ -114,7 +124,7 @@ __global__ void k_env(const unsigned short*x,int n,float*mn,float*mx,float*mv,in
     long a=(long)n*col/tw, b=(long)n*(col+1)/tw; if(b<=a) b=a+1;
     __shared__ float sm[MAXB],sx[MAXB],ss[MAXB];
     float lo=1e30f,hi=-1e30f,sum=0.0f;
-    for(long i=a+threadIdx.x;i<b;i+=blockDim.x){ float v=(float)x[i];
+    for(long i=a+threadIdx.x;i<b;i+=blockDim.x){ float v=s14(x[i]);
         lo=fminf(lo,v); hi=fmaxf(hi,v); sum+=v; }
     sm[threadIdx.x]=lo; sx[threadIdx.x]=hi; ss[threadIdx.x]=sum; __syncthreads();
     for(int d=blockDim.x/2;d>0;d>>=1){

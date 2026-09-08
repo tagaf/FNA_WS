@@ -37,6 +37,26 @@ REG_CHANNEL  = 0x08   # W  bits[1:0]
 REG_NSAMPLES = 0x0C   # W
 REG_FINISH   = 0x10   # R  bit0 = ddr_wr_finish
 
+# 14-bit TWO'S COMPLEMENT, right-aligned in a 16-bit little-endian word.
+# Established from the vendor's own client (pcie_client_sw/mainwindow.cpp),
+# which sign-extends with ((int16_t)(x<<2))>>2 and scales by
+# ADC_FS_VOLTAGE/ADC_MAX_CODE. Reading the codes as unsigned makes a signal
+# near zero appear to jump between ~0 and ~16383 at every zero crossing.
+ADC_FS_VOLTS = 1.75            # full scale, single-ended equivalent
+ADC_MAX_CODE = 8192.0
+VOLT_SCALE = ADC_FS_VOLTS / ADC_MAX_CODE     # 213.6 uV per code
+
+
+def to_signed(u):
+    """uint16 words as stored in DDR -> signed 14-bit codes."""
+    import numpy as _np
+    return ((_np.asarray(u).astype(_np.int32) ^ 0x2000) - 0x2000)
+
+
+def to_volts(u):
+    return to_signed(u) * VOLT_SCALE
+
+
 BYTES_PER_SAMPLE = 2
 SAMPLE_GRANULARITY = 256              # samples per 512-byte AXI burst
 WR_WINDOW_BYTES = 524288000           # 500 MB linear window, no wrap
@@ -54,7 +74,7 @@ VALID_CHANNELS = (CH_TEST_RAMP, CH_A, CH_B, CH_BOTH)
 # out, and the HDL's byte accounting for this mode is ambiguous
 # (burst_num is computed the same as for 16-bit mode). Verify against
 # hardware before trusting the de-interleave order.
-BOTH_INTERLEAVE = ("B", "A")
+BOTH_INTERLEAVE = ("A", "B")   # vendor client: raw[2i]=A, raw[2i+1]=B
 
 
 class CaptureTimeout(RuntimeError):
