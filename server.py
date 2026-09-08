@@ -302,9 +302,9 @@ class MockAdc:
 class MockDma:
     """Phase-continuous 25 MHz tone at -14 dBFS + noise, mimicking real data.
 
-    Reads the speed register from the paired MockAdc and drops samples like
-    the FPGA's decimator, so a divided rate shows the tone at the physically
-    correct (possibly aliased) frequency instead of a mock artifact."""
+    Samples are NOT decimated by Speed_Set, matching the HDL: that divider
+    gates only the capture FSM's sample counter, never the FIFO write enable,
+    so the data is always full rate (NOTES.md #26)."""
     path = "mock_synth"
     F0 = 25e6
 
@@ -314,9 +314,8 @@ class MockDma:
         self._rng = np.random.default_rng(0)
 
     def read_into(self, out, nsamples, addr=0):
-        step = (self._adc._r.get(A.REG_SPEED, 0) + 1) if self._adc else 1
-        t = self._phase + step * np.arange(nsamples, dtype=np.float64)
-        self._phase += step * nsamples
+        t = self._phase + np.arange(nsamples, dtype=np.float64)
+        self._phase += nsamples
         sig = (8192.0 + 1638.0 * np.sin(2 * np.pi * self.F0 / A.BASE_CLOCK_HZ * t)
                + self._rng.normal(0, 6, nsamples))
         out[:nsamples] = np.clip(sig, 0, 16383).astype(np.uint16)
@@ -338,6 +337,7 @@ class Engine:
                         trace_samples=-1,     # -1: trace shows the whole record
                                               # (explicit count still accepted)
                         classify=0,           # 1: run peak/noise classification
+                        view_ch=1,            # which channel to display in ch_sel=3
                         pfa_exp=6,            # detection sensitivity: Pfa=1e-N
                         readback=-1)   # -1 auto, 0 full N, >0 explicit
         self.trace_width = trace_width
@@ -375,6 +375,9 @@ class Engine:
         # trade. The worker takes a snapshot only when idle, so it can never
         # queue up work faster than it retires it.
         self.analysis = None
+        self.raw = None                 # recent raw samples, for /raw
+        self._raw_req = 0.0
+        self.dual = None                # per-channel stats when ch_sel=3
         self.classify_period = 1.0
         self.pfa = 1e-6
         self._an_lock = threading.Lock()
@@ -639,6 +642,8 @@ class Engine:
         self.adc.wr(A.REG_SPEED, sp_)
         self.adc.wr(A.REG_CHANNEL, ch)
         self.adc.wr(A.REG_NSAMPLES, N)
+        # duration DOES scale with the divider (the FSM counts decimated
+        # samples before releasing), even though the DATA is always full rate
         expect = N * (sp_ + 1) / A.BASE_CLOCK_HZ
         timeout = max(0.5, expect * 4 + 0.5)
         t0 = time.monotonic()
@@ -684,10 +689,32 @@ class Engine:
         # NOT gpu.FastC2H's raw os.readv(), which bisect_dma.py showed wedges
         # the SoC regardless of destination buffer type. See module docstring.
         t1 = time.monotonic()
-        nbytes = read_n * 2
-        n = self.dma.read_into(self.sp.stage, read_n)
-        self.sp.load(n * 2)
-        got = n * 2
+        if ch == A.CH_BOTH:
+            # every sample clock emits BOTH channels as one 32-bit word, so
+            # the record is twice as many uint16 words
+            nbytes = read_n * 4
+            n = self.dma.read_into(self.sp.stage, read_n * 2)
+            raw = self.sp.stage[:n]
+            first, second = raw[0::2], raw[1::2]
+            lab = A.BOTH_INTERLEAVE
+            chans = {lab[0]: first, lab[1]: second}
+            self.dual = {k: {"mean": float(v.mean()), "std": float(v.std()),
+                             "min": int(v.min()), "max": int(v.max())}
+                         for k, v in chans.items() if v.size}
+            want = "A" if cfg.get("view_ch", 1) == 1 else "B"
+            view = np.array(chans.get(want, first), copy=True)
+            np.copyto(self.sp.stage[:view.size], view)
+            n = view.size
+            self.sp.load(n * 2)
+            got = nbytes
+        else:
+            self.dual = None
+            nbytes = read_n * 2
+            n = self.dma.read_into(self.sp.stage, read_n)
+            self.sp.load(n * 2)
+            got = n * 2
+        if time.monotonic() - self._raw_req < 5.0:
+            self.raw = np.array(self.sp.stage[:min(n, 1 << 16)], copy=True)
         t_dma = time.monotonic() - t1
 
         # CUDA
@@ -825,6 +852,7 @@ class Engine:
                 "uptime_s": time.monotonic() - self.t_start,
                 "avg_depth": self._acc_n,
             },
+            "dual": self.dual,
             "sys": self._sys_cache,
             "analysis": self._live_analysis(shown, bin_hz, fs, nfft, ch)
                         if cfg.get("classify") else None,
@@ -926,6 +954,17 @@ class Handler(BaseHTTPRequestHandler):
             if f is None:
                 return self._send(503, b"no frame yet", "text/plain")
             return self._send(200, f, "application/octet-stream")
+        if p == "/raw":
+            # Raw samples straight from the last capture, for diagnosing what
+            # the converter is actually producing (stuck bits, dropouts,
+            # interleave order) without stopping the server to take the lock.
+            e = self.engine
+            e._raw_req = time.monotonic()
+            r = e.raw
+            if r is None:
+                return self._send(503, b"no raw yet - retry in a moment",
+                                  "text/plain")
+            return self._send(200, r.tobytes(), "application/octet-stream")
         if p == "/noise":
             # Full structure (family member frequencies, spur list). Fetched
             # by the client only when the frame's `sid` changes.

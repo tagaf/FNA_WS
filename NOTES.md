@@ -806,3 +806,90 @@ for the ~12000 shorted reading (section 23) and point squarely at input
 biasing. Decisive tests: read the AD9643's SPI registers if the FPGA exposes
 them, or power down, remove the mezzanine, and see whether a channel-0
 capture still completes.
+
+## 26. HDL received 2026-09-08 -- three findings, one a real bug
+
+Sources at ~/pcie_fpga_project. These settle several things that were
+previously inferred, and one inference was WRONG.
+
+### 26.1 `Speed_Set` does not decimate. fs is ALWAYS 250 Msps.
+
+`speed_ctrl.v` divides `adc_data_en`, but that signal only gates the sample
+COUNTER in `wr_ddr_ctrl.v`:
+
+    if(ad_out_valid && adc_data_en) adc_sample_cnt <= adc_sample_cnt + 1;
+
+The FIFO write enable is a different signal entirely
+(`fifo_to_axi4_ctrl.v`):
+
+    assign wr_fifo = dvalid && (ch_sel != 2'b11);
+
+and `dvalid` = `ad_out_valid` = registered `ad_sample_en`, which is high on
+EVERY adc_clk during ADC_SAMPLE. So DDR always receives full-rate samples.
+The capture takes (Speed_Set+1)x longer only because
+`write_ddr_done = (burst_cnt >= burst_num) && fifo_empty` -- the FIFO keeps
+being fed until the sampling FSM stops, so completion waits on the counter.
+
+**Section 1 was wrong**: fs = 250 MHz/(Speed_Set+1) is false, and every
+frequency axis at Speed_Set>0 was out by exactly that factor. This also
+explains, retrospectively, the two anomalies it caused: the EMI sweep's
+fundamentals appearing to halve at speed=1 (section 25 -- same bin, wrong
+assumed fs), and the aliasing test showing no folding (there is no
+decimation to fold). `sample_rate()` now returns 250 MHz unconditionally and
+the control is relabelled "Capture stretch".
+
+### 26.2 The test ramp IS FPGA-internal -- confirmed, user's guess was wrong
+
+`ad9643_14bit_to_16bit.v`:
+
+    reg [13:0] adc_test_data;
+    always@(posedge clk) adc_test_data <= ad_sample_en ? adc_test_data+1 : 0;
+    ...
+    2'b00: ad_out <= {2'd0, adc_test_data};
+
+A counter in the FPGA, cleared when sampling stops -- which is exactly why
+channel 0 always starts at 0 and is bit-identical run to run. So section 2's
+conclusion stands and section 25's doubt is resolved: **the ramp never
+traverses the ADC link, and proves nothing about it.** Capture misalignment
+therefore remains a live hypothesis for the railed/glitching ADC data.
+
+### 26.3 Dual-channel mode EXISTS: ch_sel = 2'b11
+
+    2'b11: ad_out_comb <= {2'd0, s_ad_in1, 2'd0, s_ad_in2};
+
+routed to a separate 32-bit `fifo_comb`, muxed into the same AXI writer
+(`wr_fifo_comb = dvalid && (ch_sel==2'b11)`, and dout/empty/full/rd_count
+all switch on ch_sel==3). Both channels are captured over the SAME time
+window. Channel A occupies bits [31:16], channel B [15:0], so little-endian
+uint16 order is B,A,B,A,...
+
+Now exposed as "Channel 3 -- A + B simultaneously" with a "Show" selector
+for which one to plot; both channels' statistics are reported. Marked
+EXPERIMENTAL: an earlier ch_sel=3 attempt timed out, and the HDL's byte
+accounting for this mode is ambiguous (`burst_num` is computed identically
+to 16-bit mode while each write carries two samples), so the de-interleave
+order and record length need confirming against hardware.
+
+### 26.4 The LVDS capture is uncalibrated
+
+`ad9643_md.v` samples the data with the raw DCO: `IDELAYE3` is
+`DELAY_TYPE("FIXED")` with `DELAY_VALUE(0)`, `adc_clk` is a plain BUFG off
+the incoming clock with no MMCM phase shift, and there is no training or
+bitslip. `IDDRE1` takes channel B on the rising edge and channel A on the
+falling. Nothing establishes a sampling point in the middle of the data eye,
+so the capture margin is whatever the board layout happens to give.
+
+Also worth noting: `wr_en` on both FIFOs is never gated by `wr_rst_busy` or
+by `full`, so writes during reset-recovery or overflow are silently lost.
+
+### 26.5 Measured with 50 ohm terminations fitted
+
+    ch1(A): mean 16126.5  std 1972.6  min 0      max 16383
+    ch2(B): mean 16321.6  std   16.3  min 6      max 16382
+
+Both channels are railed at POSITIVE FULL SCALE, and channel A additionally
+takes excursions all the way to 0 (a zero appears in 99% of 4096-sample
+envelope columns; channel B: none). Railing is consistent with the input
+being outside the converter's common-mode range -- a 50 ohm SMA termination
+to ground gives 0 V common mode with no front end to bias it -- and rules
+the current data unusable as a measurement either way.

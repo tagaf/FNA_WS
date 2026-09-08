@@ -43,8 +43,18 @@ WR_WINDOW_BYTES = 524288000           # 500 MB linear window, no wrap
 MAX_SAMPLES = WR_WINDOW_BYTES // BYTES_PER_SAMPLE
 BASE_CLOCK_HZ = 250e6
 
-CH_TEST_RAMP, CH_A, CH_B = 0, 1, 2
-VALID_CHANNELS = (CH_TEST_RAMP, CH_A, CH_B)
+CH_TEST_RAMP, CH_A, CH_B, CH_BOTH = 0, 1, 2, 3
+VALID_CHANNELS = (CH_TEST_RAMP, CH_A, CH_B, CH_BOTH)
+
+# ch_sel=3 drives ad_out_comb = {2'd0, ch_A, 2'd0, ch_B} into a separate
+# 32-bit FIFO (fifo_comb), muxed into the same AXI writer -- so both channels
+# are captured over the SAME time window, which is the point of the mode.
+# Little-endian: the low 16 bits (channel B) land first, so as uint16 the
+# stream is B,A,B,A,... EXPERIMENTAL: an earlier attempt at ch_sel=3 timed
+# out, and the HDL's byte accounting for this mode is ambiguous
+# (burst_num is computed the same as for 16-bit mode). Verify against
+# hardware before trusting the de-interleave order.
+BOTH_INTERLEAVE = ("B", "A")
 
 
 class CaptureTimeout(RuntimeError):
@@ -68,7 +78,20 @@ class DmaTimeout(RuntimeError):
 
 
 def sample_rate(speed=0):
-    return BASE_CLOCK_HZ / (speed + 1)
+    """Always 250 Msps. `Speed_Set` does NOT decimate -- see NOTES.md #26.
+
+    Confirmed from the HDL: `speed_ctrl` divides `adc_data_en`, but that
+    signal only gates the SAMPLE COUNTER in wr_ddr_ctrl. The FIFO write
+    enable is `dvalid` (= `ad_sample_en`), which is high on every adc_clk
+    during ADC_SAMPLE, so DDR receives full-rate samples either way. The
+    capture merely takes (Speed_Set+1)x longer, because `write_ddr_done`
+    additionally waits for `fifo_empty` and the FIFO keeps being fed until
+    the sampling FSM stops.
+
+    Treating fs as 250 MHz/(Speed_Set+1) put every frequency axis at
+    Speed_Set>0 out by exactly that factor.
+    """
+    return BASE_CLOCK_HZ
 
 
 class Adc:
@@ -105,8 +128,8 @@ class Adc:
     def _validate(nsamples, channel, speed):
         if channel not in VALID_CHANNELS:
             raise ValueError(
-                f"Channel_Set={channel} invalid; use 1=A, 2=B, 0=test ramp "
-                f"(3 hangs the capture FSM)")
+                f"Channel_Set={channel} invalid; use 1=A, 2=B, 3=both, "
+                f"0=test ramp")
         if speed < 0 or speed > 0xFFFFFFFF:
             raise ValueError("speed out of range")
         if nsamples < SAMPLE_GRANULARITY:

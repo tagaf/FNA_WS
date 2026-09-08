@@ -47,6 +47,8 @@ def applied(want, last, tmo=12):
     raise TimeoutError(f"cfg never applied: {want}")
 
 def alias(f0,fs):
+    # fs is always 250 MHz now (Speed_Set does not decimate), so the mock's
+    # 25 MHz tone never aliases; kept for the general case
     fa=f0%fs
     return min(fa,fs-fa)
 
@@ -73,7 +75,7 @@ try:
         post(cfg); m,disp,last=applied(cfg,last)
         # settle one extra frame (EMA reset etc.)
         m,disp,last=applied(cfg,last)
-        fs=BASE/(cfg["speed"]+1); nfft=cfg["nfft"]; N=cfg["nsamples"]
+        fs=BASE; nfft=cfg["nfft"]; N=cfg["nsamples"]   # Speed_Set != rate
         fa=alias(F0,fs)
         a=m["acq"]; ok=True
         ok&=chk("fs",abs(m["fs_hz"]-fs)<1,f"{m['fs_hz']}")
@@ -146,12 +148,13 @@ try:
     post({"running":True})
 
     # invalid channel: error surfaces, then clears
-    post({"channel":3}); time.sleep(0.8)
+    # channel 3 is dual-channel capture (valid); 4 is out of range
+    post({"channel":4}); time.sleep(0.8)
     e1=json.loads(get("/status").read())["err"] or ""
     post({"channel":1}); time.sleep(0.8)
     e2=json.loads(get("/status").read())["err"]
-    chk("ch3-err","Channel_Set=3" in e1 and e2 is None,f"err1={e1[:60]!r} err2={e2!r}")
-    print(f"channel=3 rejected then recovers: {'OK' if 'Channel_Set=3' in e1 and e2 is None else 'FAIL'}")
+    chk("bad-channel-err","Channel_Set=4" in e1 and e2 is None,f"err1={e1[:60]!r} err2={e2!r}")
+    print(f"channel=4 rejected then recovers: {'OK' if 'Channel_Set=4' in e1 and e2 is None else 'FAIL'}")
 
     st=json.loads(get("/status").read())
     print(f"\ntimeouts={st['timeouts']}  residual err={st['err']}")

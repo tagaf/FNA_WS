@@ -148,11 +148,14 @@ tr:last-child td{border-bottom:0}
           <select id="channel">
             <option value="1">1 — ADC A</option>
             <option value="2">2 — ADC B</option>
-            <option value="0">0 — internal test ramp</option>
+            <option value="3">3 — A + B simultaneously</option>
+            <option value="0">0 — internal test ramp (FPGA counter)</option>
           </select>
+          <label>Show</label>
+          <select id="view_ch" title="Which channel to plot when Channel = 3. Both are captured over the same time window; this only picks the one displayed."></select>
           <label>Samples</label>
           <select id="nsamples"></select>
-          <label>Rate divider</label>
+          <label title="Does NOT change the sample rate. It gates only the capture FSM's sample counter, so the data is always 250 Msps and the capture just takes (n+1) times longer. Leave at 0.">Capture stretch</label>
           <select id="speed"></select>
           <label>FFT size</label>
           <select id="nfft"></select>
@@ -269,10 +272,14 @@ buildNsampleOpts(MAX_SAMPLES); // sane default before /limits answers
 fetch('/limits',{cache:'no-store'}).then(r=>r.json()).then(lim=>{
   buildNsampleOpts(lim.max_samples);
 }).catch(()=>{});
+// Speed_Set does NOT change the sample rate: it gates only the sample
+// counter, not the FIFO write enable, so DDR always gets 250 Msps data and
+// the capture simply takes (n+1)x longer. See NOTES.md #26.
 opts($('speed'),[0,1,3,7,15,31,63,255],
-     v=>`${v} — ${(250/(v+1)).toFixed(3)} Msps`,0);
+     v=>v===0?'0 — normal':`${v} — ${v+1}× slower capture, same 250 Msps`,0);
 opts($('avg'),[1,2,4,8,16,32],v=>v==1?'1 (off)':v+'\u00d7 EMA',4);
 opts($('classify'),[0,1],v=>v?'on — label noise sources':'off',0);
+opts($('view_ch'),[1,2],v=>v===1?'ADC A':'ADC B',1);
 opts($('persist'),[0,0.5,2,10,-1],
      v=>({0:'off',0.5:'0.5 s',2:'2 s',10:'10 s','-1':'hold'})[v],0);
 opts($('pfa_exp'),[2,3,4,6,9],
@@ -282,7 +289,7 @@ opts($('max_frames'),[1,2,4,8,16,32,64,128,256],v=>v==1?'1 (single FFT)':v+'\u00
 function fmtDur(sec){const [k,u]=axTimeUnit(sec);return axNum(sec*k)+' '+u}
 
 // ---- pending/applied confirmation for control changes
-const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames','classify','pfa_exp'];
+const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames','classify','pfa_exp','view_ch'];
 const pending={};
 function markPending(id){
   pending[id]=$(id).value;
@@ -837,6 +844,13 @@ function render(m,dispSpec,zoomSpec,tmin,tmax,tmean){
     ['batch',m.nframes+' × '+m.cfg.nfft],
     ['GPU mem used',si(g.mem_total-g.mem_free)+' / '+si(g.mem_total)],
   ]);
+  // in dual mode report BOTH channels, since both were captured together
+  if(m.dual){
+    const rows=Object.entries(m.dual).map(([k,v])=>
+      [`ch ${k}`,`${f(v.mean,1)} ± ${f(v.std,2)} (${v.min}–${v.max})`,
+       (v.max>=16380||v.min<=2)?'v-bad':'']);
+    fill($('tSig'),rows.concat([['—','both captured in the same window']]));
+  } else
   fill($('tSig'),[
     ['peak',eng(s.peak_hz)],
     ['peak level',f(s.peak_db,2)+' dBFS'],
