@@ -1090,3 +1090,35 @@ the same inputs.
 The EMA accumulator is now per trace. Peaks, the noise classifier and the
 signal panel still read trace 0 (channel A) -- the spectrum analysis is
 single-source by design; the second trace is drawn, not analysed.
+
+## 33. Are the two channels sampled simultaneously? Yes -- 2026-09-08
+
+Asked whether dual mode captures A and B at the same instant or takes a
+block of one then a block of the other.
+
+**From the HDL it is sample-by-sample interleaved, not blocked.** In
+`ad9643_md.v` a single `IDDRE1` recovers both channels from the same LVDS
+lane on opposite edges of the ADC clock (`Q1` -> B, `Q2` -> A), and they are
+registered together on one `posedge adc_clk`. `ad9643_14bit_to_16bit.v` then
+emits ONE 32-bit word per sample clock holding both:
+`ad_out_comb <= {2'd0, s_ad_in1, 2'd0, s_ad_in2}`. There is no buffering that
+could serialise a millisecond of one channel ahead of the other.
+
+**Confirmed on hardware** (`tools/channel_skew.py`). Splitting the record
+even/odd gives two streams whose DC levels stay 47 codes apart with only
+0.42 codes of drift across 8 chunks of the record. Were it blocked, each
+array would contain half of each block and both would step by ~47 codes
+partway through. They do not.
+
+Residual skew is NOT resolved: the delay search over coherent cross-spectrum
+bins returns -13.5 ns (-3.4 samples) but with the score at zero skew still
+0.74 of the peak -- a shallow optimum, because the only common-mode signal
+on a bare board is narrowband switching noise, which makes delay ambiguous.
+It does rule out anything remotely like a block offset (1 ms = 250,000
+samples). For a real skew number, split one generator output to both inputs
+with equal-length cables and re-run the tool.
+
+Method note: the first attempt unwrapped phase across the sparse set of
+coherent bins and reported a confident -87 ns. That is wrong -- gaps between
+retained bins exceed pi and unwrap incorrectly. The tool now searches for the
+delay that best aligns the phase instead, with no unwrapping.
