@@ -59,7 +59,13 @@ def to_volts(u):
 
 BYTES_PER_SAMPLE = 2
 SAMPLE_GRANULARITY = 256              # samples per 512-byte AXI burst
-WR_WINDOW_BYTES = 524288000           # 500 MB linear window, no wrap
+# 500 MB DDR window. The FPGA writer WRAPS at the end (fifo_to_axi4.v:
+#   else if(m_axi_awaddr >= WR_AXI_BYTE_ADDR_END)
+#       m_axi_awaddr <= WR_AXI_BYTE_ADDR_BEGIN;
+# so it is a ring buffer, not the linear one the original handoff described.
+# Irrelevant for one-shot capture (the address is reset per trigger), but it
+# matters for any future streaming mode -- see NOTES.md #34.
+WR_WINDOW_BYTES = 524288000
 MAX_SAMPLES = WR_WINDOW_BYTES // BYTES_PER_SAMPLE
 BASE_CLOCK_HZ = 250e6
 
@@ -160,10 +166,19 @@ class Adc:
             raise ValueError(
                 f"nsamples must be a multiple of {SAMPLE_GRANULARITY} "
                 f"(got {nsamples}); other values hang or silently truncate")
-        if nsamples > MAX_SAMPLES:
+        cap = MAX_SAMPLES // 2 if channel == CH_BOTH else MAX_SAMPLES
+        if nsamples > cap:
+            # A+B emits one 32-bit word per sample clock into the SAME
+            # 500 MiB window (NOTES.md #26.3), so a dual capture reaches the
+            # end of it at half the sample count. Past that the FPGA wraps
+            # and the readback is a record spliced onto itself -- which looks
+            # entirely plausible in a spectrum, and is a step discontinuity
+            # in a demodulated phase.
             raise ValueError(
                 f"nsamples exceeds the {WR_WINDOW_BYTES} B capture window "
-                f"(max {MAX_SAMPLES})")
+                f"(max {cap}" + (" in dual-channel mode, where every sample "
+                                 "clock writes two words)" if channel == CH_BOTH
+                                 else ")"))
 
     def recover(self):
         """Re-arm on a known-good setting to walk the FSM out of a hang."""

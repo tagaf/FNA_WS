@@ -1122,3 +1122,197 @@ Method note: the first attempt unwrapped phase across the sparse set of
 coherent bins and reported a confident -87 ns. That is wrong -- gaps between
 retained bins exceed pi and unwrap incorrectly. The tool now searches for the
 delay that best aligns the phase instead, with no unwrapping.
+
+## 34. Laser phase noise with TWO photodiodes, 2026-09-10
+
+Goal: an unbalanced Michelson (3x3 coupler, two Faraday rotator mirrors, 10 m
+delay fibre) read by this board, giving laser phase/frequency noise and
+linewidth. Method: Xu et al., Opt. Express 23, 22386 (2015). The prototype has
+**two photodiodes, not the paper's three**, which changes one thing
+fundamentally and nothing else at all.
+
+`phasenoise.py` + `tests/test_phasenoise.py` (29 tests, no hardware),
+`--mock-interferometer` for a synthetic laser of known linewidth, and a
+Phase noise tab fed by `GET /pn`.
+
+### 34.1 Delay
+
+Michelson is double-pass: 10 m of fibre is 20 m of path.
+tau = 2 n_g L / c = 97.94 ns with n_g = 1.4682, FSR = 1/tau = 10.21 MHz,
+which is 24.48 samples at 250 MS/s -- deliberately not an integer, and the
+mock interpolates the delay rather than rounding it, because rounding moves
+the sin^2 nulls the analysis exists to undo.
+
+### 34.2 Why two ports is a real difference
+
+Three ports over-determine the 120-degree hybrid, so Xu's eq. 2 un-mixes it
+linearly, calibrates every sample, and cancels common-mode RIN. Two ports
+give one equation short. What saves it is that (I_1, I_2) traces an ELLIPSE:
+a general conic has five degrees of freedom, exactly matching the five
+unknowns (dc1, dc2, a1, a2, psi). Fit it (Halir & Flusser -- Fitzgibbon's
+6x6 scatter matrix is hopelessly conditioned on raw ADC codes) and
+
+    I = (x-dc1)/a1,   Q = (I cos psi - (y-dc2)/a2) / sin psi,   dphi = atan2
+
+is immune to the coupler's real splitting ratios and to unequal photodiode
+responsivities -- the same robustness the paper gets from calibrating
+eta/zeta/xi with a broadband source, taken from the data instead.
+
+Cost: the conic is only determined once the operating point has been round
+the fringe, and **it will not go round inside one record**. A 2 kHz laser
+moves dphi by sqrt(2 pi dnu tau) = 35 mrad over a 98 ns delay. What sweeps
+the fringe is interferometer drift over seconds. So calibration accumulates
+in a ring of the last ~128 records (`Engine._pn_push_cal`) and is refitted
+continuously; a fit that fails its checks never evicts one that passed.
+
+### 34.3 The gate: three attempts, two of them wrong
+
+This is the part worth reading before touching it.
+
+**Attempt 1 -- fringe coverage.** Normalise by the fitted ellipse, histogram
+the resulting angles, require >35% occupancy. Wrong, and wrong in the worst
+way: a short arc admits a FAMILY of ellipses that fit it equally well, the
+algebra picks an elongated member, and normalising by that member smears the
+arc right around the unit circle. Measured on a stuck mock interferometer:
+span 1.00, amplitudes wrong by 60%. At realistic detector noise, span read
+0.99 on a fit that was 95% wrong. The metric is computed THROUGH the thing it
+is supposed to be checking.
+
+**Attempt 2 -- radial residual.** Also fails, for a related reason: the arc
+genuinely does lie on the wrong ellipse. Measured 0.003 on the 59%-wrong fit.
+(Residual is kept, but for what it can actually catch -- a cloud that is not
+an ellipse at all: clipping, a dead channel, a cycle slip. A truly degenerate
+single-record fit does reach 0.5.)
+
+**Attempt 3, kept -- split the history in TIME and refit each half.** A
+determined ellipse gives the same answer twice; an under-determined one gives
+two different members of the family. The split must be chronological:
+interleaving the points instead measures only the noise, and both halves
+inherit the same bias (measured 0.004 disagreement on the 59%-wrong fit).
+
+Calibrated across drift 0..3 fringes x detector noise 2 and 40 codes on a
+2600-code fringe, 18 configurations, threshold 0.002:
+
+    accepted  -> parameters good to 1.7% or better  (every case)
+    rejected  -> parameters wrong by 11% or more    (every case)
+
+no misclassifications, and a clear gap between the two. Kept as a test
+(`test_the_gate_tracks_the_real_error_across_noise`) so the threshold cannot
+silently rot. On a single record the gate opens at ~0.8 fringes traversed --
+i.e. exactly "a conic needs the whole conic" -- and it is deliberately
+conservative below that: at 0.6 fringes the fit happens to be right and is
+still refused, because the cost of waiting is smaller than the cost of
+publishing a wrong linewidth.
+
+**What refusal is worth.** With the gate off, the stuck mock reported 175 kHz
+for a laser built to be 50 kHz: smooth, plausible, and 3.5x wrong. That is
+the whole argument for `require_cal` defaulting on.
+
+### 34.4 Two bugs the phase measurement exposed in existing code
+
+* **The FSR null guard was blanking the low end.** `convert()` masked a +-3%
+  band around every multiple of 1/tau where sin(pi f tau) -> 0. k = 0 is not
+  one of those: as f -> 0 the correction tends to 1/(2 pi f tau)^2, the
+  ordinary frequency-discriminator response, and S_dphi tends to a constant
+  with it, so S_phi -> h0/f^2 is finite and correct. Guarding k = 0 blanked
+  everything below 0.03/tau = 306 kHz -- most of a laser phase-noise plot.
+* **Dual-channel reads were silently truncating at N > 2^21.** A dual capture
+  is two 16-bit WORDS per sample clock, but the read landed in
+  `Spectrum.stage`, sized for max_samples SAMPLES. `ddr_read_into` clips to
+  `len(out)` and returns the short count, so at any larger N half the record
+  was quietly discarded and the spectrum was of half a record. Now reads into
+  a dedicated `Engine._dual_words()` buffer. Related: `_validate` now caps
+  dual captures at MAX_SAMPLES/2 = 131,072,000, because past that the FPGA
+  wraps within the same 500 MiB window and the readback is a record spliced
+  onto itself.
+
+Also: the calibration ring was first fed RAW uint16, while the analysis got
+sign-extended codes (§27). uint16 wraps at code 0, so every negative
+excursion jumps to ~16383, the Lissajous shatters into fragments, and the fit
+returns 10000-code amplitudes on a 2600-code fringe -- confidently, since
+fragments still admit a conic. Sign extension now happens once, in
+`_pn_loop`, and both paths use that array.
+
+### 34.5 Estimator bias, and why everything is log-binned
+
+First end-to-end runs came back 1.6 dB low, consistently. That is exactly
+ln 2: `white_linewidth` took a MEDIAN over raw Welch bins, and a single-
+segment periodogram bin is exponentially distributed, whose median sits
+ln 2 = -1.59 dB below its mean. Fixed by taking every downstream statistic
+from the LOG-BINNED PSD, where each bucket is the unbiased mean of the bins
+inside it. Binning also earns its keep twice more: bucket mean x bucket width
+preserves area, so the linewidth integral is unaffected; and averaging within
+buckets is free variance reduction that grows with f, which is the benefit
+multi-rate PSD stitching exists for, without a second pass over the data.
+
+### 34.6 Cost
+
+A 268 ms record is 67 M samples per channel. Full-rate arctangent + unwrap is
+~1.5 s at 16.7 M and scales linearly, so the default decimates the QUADRATURE
+PAIR before the arctangent (I and Q are linear in the photocurrents, so this
+is ordinary I/Q downconversion, and it is exact while exp(j dphi) fits below
+the new Nyquist -- which it does, since dphi is milliradians). ~10x cheaper;
+`Demodulation: full rate arctangent` is there for when it is not.
+Auto-decimation picks the largest power of two keeping Nyquist above the
+usable band; at tau = 98 ns that is /16 -> 15.6 MS/s against a 5.1 MHz band.
+I/Q are float32 (order 1, so float32 resolves them 100x finer than the ADC's
+own 1/2600 of a fringe); the unwrapped phase stays float64 because it
+accumulates the drift ramp.
+
+### 34.7 Verified
+
+`--mock-interferometer` builds a laser whose Lorentzian FWHM is set by
+construction (Wiener phase with step variance 2 pi dnu / fs). End to end
+through the server, HTTP and the tab's render path:
+
+    planted 50 kHz  ->  49.85 kHz    planted 500 kHz -> within 15%
+    ellipse: planted dc (-300, 450) a (2600, 2100) psi 118.0 deg
+             recovered   (-300.0, 450.0)  (2600.0, 2100.0)  118.0 deg
+
+Browser QA was not possible: headless Chromium finds no usable sandbox under
+this host's AppArmor policy. `tests/test_pn_render.js` runs the tab's real
+draw path against a real `/pn` payload under a DOM stub instead, including
+the four non-result states and an all-masked spectrum, and `tests/test_ui.py`
+drives it. **None of this has run against the actual optical setup yet** --
+no interferometer has been connected.
+
+## 34. Correction: the DDR writer WRAPS. Streaming is closer than stated.
+
+Asked about the capture FSM, and re-reading `fifo_to_axi4.v` turned up a
+fact this repo had wrong from the very first handoff and I repeated several
+times: the write address is **not** a linear buffer with a hard stop.
+
+    else if(m_axi_awaddr >= WR_AXI_BYTE_ADDR_END)
+        m_axi_awaddr <= WR_AXI_BYTE_ADDR_BEGIN;
+
+It wraps. The 500 MB window is a **ring buffer**. Corrected in README.md and
+ad9643.py, both of which said "linear, no wrap".
+
+The FSM itself is exactly as described -- strictly one-shot:
+
+    IDLE        -> WR_FIFO_CLR   on a rising edge of RestartReq
+    WR_FIFO_CLR -> ADC_SAMPLE    when !wrfifo_full and the 9-cycle clear ends
+    ADC_SAMPLE  -> ADC_FINISH    when adc_sample_cnt >= DataNum-1
+    ADC_FINISH  -> IDLE          unconditionally
+
+`ad_sample_en` is high only in ADC_SAMPLE, so sampling is bounded by
+DataNum. ADC_FINISH is a single pass-through cycle that does nothing --
+`Adc_Finish` comes from `write_ddr_done` in fifo_to_axi4.v, not from the FSM.
+
+**So what is actually missing for FPGA-level streaming is less than
+section 26/29 implied.** Already present: a wrapping ring buffer, and a
+writer with no stop condition (it issues bursts whenever the FIFO holds >= 32
+words; `burst_cnt` only saturates to drive the done flag). Still missing:
+
+1. a way to hold ADC_SAMPLE indefinitely (or simply a very large DataNum --
+   32-bit, so up to ~17 s at 250 Msps before the counter runs out);
+2. **a host-readable write pointer.** `m_axi_awaddr` is not exposed through
+   AXI_CMD, which has only five registers. Without it the host cannot tell
+   which part of the ring is fresh, which is the real blocker -- not the
+   buffer;
+3. overrun detection: `wr_en` on both FIFOs is ungated by `full`, so a host
+   that falls behind is never told.
+
+Adding a write-pointer register plus a continuous mode is a much smaller
+change than building ring buffering from scratch. It still needs a rebuild,
+and the -2.533 ns timing failure (section 29) should be closed first.

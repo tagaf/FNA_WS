@@ -26,6 +26,7 @@ cuda/build.sh                      # one-time: build the CUDA spectrum engine
 make -C native                     # optional: fast-DMA helper (see below)
 python3 server.py                  # → http://<jetson-ip>:8090/
 python3 server.py --mock           # no hardware: synthetic 25 MHz tone
+python3 server.py --mock-interferometer   # ...a mock laser + interferometer
 ```
 
 Port 8090 by default (8080 is taken locally by `openshell-gateway`). If the
@@ -111,6 +112,9 @@ the long-poll transport self-adapts to a slow link by delivering fewer,
 | `native/xdma_shm_reader.c` | resident DMA helper — vendor-exact device access minus per-frame spawn (opt-in, below) |
 | `validate_fast_dma.py` | hardware qualification for the helper — run once before `--fast-dma` |
 | `noise.py` | peak detection + noise classification: CFAR, sub-bin refinement, harmonic sieve, rule-based labels |
+| `phasenoise.py` | laser phase/frequency noise: ellipse calibration, quadrature demodulation, Xu PSD relations, beta-separation linewidth |
+| `tests/test_phasenoise.py` | `phasenoise.py` against synthetic interferograms of known linewidth (no hardware) |
+| `tests/test_pn_render.js` | the phase-noise tab's draw path against a real `/pn` payload under a DOM stub |
 | `tools/emi_sweep.py` | drives the server across channel/fs conditions, classifies, cross-references, saves JSON |
 | `tests/test_controls.py` | full control-matrix regression against `--mock` (no hardware needed) |
 | `tests/test_noise.py` | `noise.py` unit tests against synthetic spectra (no hardware) |
@@ -130,6 +134,8 @@ the long-poll transport self-adapts to a slow link by delivering fewer,
 | `GET /status` | tiny JSON: running/frames/timeouts/err |
 | `GET /limits` | hardware constants (granularity, max samples, base clock) |
 | `POST /control` | any subset of `{nsamples, channel, speed, nfft, max_frames, avg, trace_samples, readback, running, trigger, zoom}` |
+| `GET /pn` | latest phase-noise result (JSON; polled only while its tab is open) |
+| `POST /pn/control` | `{enabled, length_m, n_group, double_pass, tau_ns, decim, nperseg, window, f_max_hz, npts, predecimate, cal_mode, psi_deg, require_cal, recalibrate}` |
 | `POST /restart` | clean exit; systemd restarts it |
 
 ## DMA readback paths — read §5 before touching this
@@ -149,6 +155,8 @@ the long-poll transport self-adapts to a slow link by delivering fewer,
 ## Testing
 
 ```bash
+python3 tests/test_phasenoise.py   # phase-noise DSP vs known-linewidth mocks
+python3 tests/test_ui.py           # UI syntax + the phase-noise render path
 python3 tests/test_controls.py     # spins up --mock on localhost; asserts
                                    # frequency mapping, alias positions,
                                    # display metadata, welch/trace splits,
@@ -199,9 +207,90 @@ are grey. It runs ~1x/s in a worker thread -- measured cost to the capture
 loop is 0% -- and markers are hidden whenever the analysis and the displayed
 frame disagree on fs/nfft/channel.
 
+## Laser phase noise (Phase noise tab)
+
+An unbalanced Michelson built from a 3x3 fibre coupler, two Faraday rotator
+mirrors and **10 m of delay fibre** turns laser phase noise into two
+photocurrents this board can digitise on channel 3 (A and B from the same
+sample clock). The method is Xu et al., *Opt. Express* **23**, 22386 (2015);
+`phasenoise.py` implements it and `NOTES.md` §34 records what had to change
+for two photodiodes instead of three.
+
+```bash
+python3 server.py --mock-interferometer     # no hardware: 50 kHz mock laser
+python3 tests/test_phasenoise.py            # 29 tests, no hardware
+```
+
+**Delay.** A Michelson is double-pass, so 10 m of fibre is 20 m of path:
+tau = 2 n_g L / c = **97.9 ns**, FSR = 1/tau = **10.2 MHz**. Set the fibre
+length (or tau directly, if you have measured the FSR) in the tab; every
+absolute level scales with it.
+
+**What comes out**, from the demodulated differential phase dphi(t):
+
+| | |
+|---|---|
+| `S_dphi` | PSD of dphi itself — what the interferometer directly measures |
+| `S_dnu` | = `S_dphi`/(2 pi tau)^2, differential frequency |
+| `S_phi` | = `S_dphi`/(4 sin^2(pi f tau)), the laser's own phase noise |
+| `S_nu` | = f^2 `S_phi`, the laser's own frequency noise |
+| `L(f)` | = `S_phi`/2, SSB phase noise |
+| FWHM | beta-separation-line method (Di Domenico 2010), as a curve vs observation time |
+
+`S_dphi` and `S_phi` are **not** the same quantity and differ by decades at
+low f; the paper makes this its main point and the tab plots both so the
+difference is visible. The 1/sin^2 correction diverges at every multiple of
+the FSR — those bands are masked, and the analysis stops at 1/(2 tau) =
+5.1 MHz by default.
+
+### Two photodiodes, not three — and why calibration is the whole game
+
+Three ports let the 120-degree hybrid be un-mixed linearly (Xu eq. 2) and
+calibrate instantly. Two ports do not, so this build fits the **ellipse** that
+(I_1, I_2) traces against each other: a general conic has five degrees of
+freedom, exactly the number of unknowns (both offsets, both amplitudes, and
+the actual hybrid angle psi). That makes the measurement immune to the
+coupler's real splitting ratios and to unequal photodiode responsivities —
+but only once the operating point has travelled round the fringe.
+
+It will not do that inside one record. A 2 kHz laser moves dphi by tens of
+**milli**radians over a 98 ns delay; what sweeps the fringe is interferometer
+drift over seconds. So calibration is **accumulated across captures** (a ring
+of the last ~128 records) and refitted continuously. The Lissajous plot in the
+tab is that ring: **when it has closed into a full ellipse the numbers are
+real, and until then they are refused.**
+
+That refusal is deliberate. An under-determined ellipse still produces a
+smooth, plausible, wrong linewidth — measured 175 kHz for a laser built to be
+50 kHz. The gate is **not** fringe coverage, which cannot work: a short arc is
+fitted happily by a wrong elongated ellipse that then reports full coverage
+(and a low residual, since the arc really does lie on it). The gate is
+whether the first and second halves of the calibration history fit the *same*
+ellipse — they do to <0.2% when it is determined, and disagree by percent when
+it is not. `Gate: show provisional numbers` overrides it deliberately.
+
+If the interferometer is too stable to drift, warm one arm gently, or nudge
+the laser's temperature setpoint, until the ellipse closes. Then
+**⟲ Recalibrate** after anything that moves the fringe: touching the fibre,
+changing laser power, moving a photodiode.
+
+### Reading the plot honestly
+
+- Below roughly a kilohertz you are looking at the **interferometer's**
+  thermal and acoustic noise, not the laser's. The paper's answer is an
+  aluminium box inside a foam box with both arms laid parallel.
+- There is still no analogue front end: no anti-alias filter, no termination,
+  no calibration to volts. The phase demodulation does not care (it is
+  ratiometric), but the photodiode levels shown in mV are nominal.
+- Laser RIN is common-mode and three ports would cancel it; two cannot.
+- The sign of psi is not recoverable from a conic, so swapping the two
+  photodiodes conjugates dphi. Every quantity above depends on |dphi|^2, so
+  nothing changes.
+
 ## Known constraints (evidence in NOTES.md)
 
-- Max capture 262,144,000 samples (500 MiB window, linear, no wrap) ≈
+- Max capture 262,144,000 samples (500 MiB window; the writer's address DOES
+  wrap back to 0 at the end, so it is a ring, not a linear buffer) ≈
   1.05 s at 250 Msps; `nsamples` must be a multiple of 256 (§3 — other
   values hang or silently truncate).
 - `Channel_Set`: 0 = FPGA test ramp (not ADC data), 1/2 = ADC A/B
@@ -209,6 +298,9 @@ frame disagree on fs/nfft/channel.
   been connected yet), 3 = hangs the FSM (recoverable, §2).
 - `Adc_Finish` idles high from the previous capture — poll it only after
   confirming it dropped (§ Operational notes).
+- **Dual-channel captures cap at half the sample count** (131,072,000):
+  A+B writes two 16-bit words per sample clock into the same 500 MiB window.
+  Past that the FPGA wraps and the readback is a record spliced onto itself.
 - **One capture client at a time.** The register interface has no
   arbitration; `server.py` enforces this with a lock file (§6).
 - No analogue front end: no anti-alias filter, no termination, no

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ad9643 as A
 import gpu
 import noise
+import phasenoise as PN
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
@@ -325,13 +326,78 @@ class MockDma:
         pass
 
 
+class MockInterferometer:
+    """Synthetic 3x3-coupler Michelson on channel 3, for the phase-noise tab.
+
+    Emits the interleaved dual-channel format the FPGA produces (word 2i =
+    A, 2i+1 = B, both 14-bit two's complement in a uint16) carrying two
+    photocurrents from a laser with a KNOWN Lorentzian linewidth: phi is a
+    random walk of step variance 2 pi dnu / fs, and dphi = phi(t) - phi(t-tau)
+    with the delay interpolated, since tau is 24.48 samples at 250 MS/s and
+    rounding it would move the sin^2 nulls the analysis has to undo.
+
+    The operating point is also swept slowly across whole fringes. That is
+    not decoration: with two photodiodes the ellipse calibration is only
+    determined once the fringe has been traversed, so a mock that sat at one
+    operating point would exercise the refusal path and nothing else. Real
+    interferometers drift like this on their own; `--mock-drift 0` reproduces
+    a stuck one on purpose.
+    """
+    path = "mock_interferometer"
+
+    def __init__(self, adc=None, dnu_hz=50e3, length_m=10.0, psi_deg=118.0,
+                 drift_hz=40.0, seed=0):
+        self._adc = adc
+        self.tau = PN.tau_from_length(length_m)
+        self.dnu = dnu_hz
+        self.psi = np.radians(psi_deg)
+        self.drift_hz = drift_hz
+        self._rng = np.random.default_rng(seed)
+        ts = self.tau * A.BASE_CLOCK_HZ
+        self._k = int(np.floor(ts))
+        self._a = ts - self._k
+        self._tail = np.zeros(self._k + 2)       # walk continuity across frames
+        self._phi0 = 0.0
+        self._n = 0
+
+    def read_into(self, out, nsamples, addr=0):
+        # nsamples counts 16-bit WORDS in dual mode: two per sample clock
+        n = nsamples // 2
+        k, a = self._k, self._a
+        steps = self._rng.normal(0.0, np.sqrt(2 * np.pi * self.dnu /
+                                              A.BASE_CLOCK_HZ), n)
+        phi = np.concatenate((self._tail, self._phi0 + np.cumsum(steps)))
+        self._tail = phi[-(k + 2):].copy()
+        self._phi0 = float(phi[-1])
+        cur = phi[k + 2:]
+        dly = ((1 - a) * phi[2:2 + n] + a * phi[1:1 + n])
+        dphi = cur - dly
+        t = (self._n + np.arange(n)) / A.BASE_CLOCK_HZ
+        self._n += n
+        drift = 2 * np.pi * self.drift_hz * t
+        noise_a = self._rng.normal(0, 3.0, n)
+        noise_b = self._rng.normal(0, 3.0, n)
+        ia = -300.0 + 2600.0 * np.cos(dphi + drift) + noise_a
+        ib = 450.0 + 2100.0 * np.cos(dphi + drift + self.psi) + noise_b
+        w = np.empty(2 * n, np.uint16)
+        w[0::2] = np.clip(np.round(ia), -8192, 8191).astype(np.int16).view(np.uint16) & 0x3FFF
+        w[1::2] = np.clip(np.round(ib), -8192, 8191).astype(np.int16).view(np.uint16) & 0x3FFF
+        m = min(out.size, w.size)
+        out[:m] = w[:m]
+        return m
+
+    def close(self):
+        pass
+
+
 # ------------------------------------------------------------ acquisition
 class Engine:
     def __init__(self, nsamples=1 << 20, channel=1, speed=0, nfft=8192,
                  max_frames=64, trace_width=1024, avg=4, min_period=0.005,
-                 fast_dma=False, mock=False):
+                 fast_dma=False, mock=False, mock_opts=None):
         self.fast_dma = fast_dma
-        self.mock = mock
+        self.mock = mock                  # False | True | "interferometer"
+        self.mock_opts = mock_opts or {}
         self.cfg = dict(nsamples=nsamples, channel=channel, speed=speed,
                         nfft=nfft, max_frames=max_frames, avg=avg,
                         trace_samples=-1,     # -1: trace shows the whole record
@@ -381,6 +447,42 @@ class Engine:
         self._ch_fail = 0               # consecutive timeouts on this channel
         self.classify_period = 1.0
         self.pfa = 1e-6
+
+        # ---- phase noise (see phasenoise.py). Its own worker for the same
+        # reason classification has one: a full demodulate + Welch over a
+        # 67 M-sample dual record is ~1 s of CPU, and the capture loop must
+        # not wait for it. Unlike classification it also carries STATE across
+        # captures -- the ellipse calibration is accumulated from the drift
+        # of the operating point over many records, because one record from a
+        # narrow-linewidth laser moves dphi by milliradians and determines
+        # nothing on its own.
+        self.pn_cfg = dict(
+            enabled=0,
+            length_m=10.0,           # delay fibre in the long arm
+            n_group=PN.GROUP_INDEX,
+            double_pass=1,           # Michelson: the fibre is traversed twice
+            tau_ns=0.0,              # >0 overrides the geometry above
+            decim=0,                 # 0 = auto from tau
+            nperseg=0,               # 0 = the whole record in one segment
+            window="hann",
+            f_max_hz=0.0,            # 0 = 1/(2 tau)
+            npts=600,
+            predecimate=1,
+            cal_mode="auto",         # auto | hold | nominal
+            psi_deg=120.0,           # nominal 3x3 hybrid angle
+            require_cal=1,
+            period_s=0.0,            # min seconds between analyses
+        )
+        self.pn = None               # latest result, JSON-ready
+        self.pn_cal = None           # PN.Cal carried across captures
+        self.pn_sid = 0
+        self._pn_acc = None          # (N,2) float32 ring of calibration points
+        self._pn_acc_n = 0
+        self._pn_lock = threading.Lock()
+        self._pn_cv = threading.Condition(self._pn_lock)
+        self._pn_req = None
+        self._pn_last = 0.0
+        self._dual_stage = None      # landing buffer for interleaved A/B reads
         self._an_lock = threading.Lock()
         self._an_cv = threading.Condition(self._an_lock)
         self._an_req = None
@@ -391,7 +493,9 @@ class Engine:
     def start(self):
         if self.mock:
             self.adc = MockAdc()
-            self.dma = MockDma(self.adc)
+            self.dma = (MockInterferometer(self.adc, **self.mock_opts)
+                        if self.mock == "interferometer"
+                        else MockDma(self.adc))
         else:
             self.adc = A.Adc()
             self.dma = DmaReader(self.fast_dma)
@@ -404,6 +508,8 @@ class Engine:
         self.an_th.start()
         self._sys_th = threading.Thread(target=self._sys_loop, daemon=True)
         self._sys_th.start()
+        self.pn_th = threading.Thread(target=self._pn_loop, daemon=True)
+        self.pn_th.start()
 
     def stop(self):
         self._stop.set()
@@ -414,9 +520,13 @@ class Engine:
         # covers worst case plus Spectrum teardown of the largest buffers.
         with self._an_lock:
             self._an_cv.notify_all()
+        with self._pn_lock:
+            self._pn_cv.notify_all()
         self.th.join(timeout=20)
         if getattr(self, "an_th", None):
             self.an_th.join(timeout=5)
+        if getattr(self, "pn_th", None):
+            self.pn_th.join(timeout=10)
         self.sp.close(); self.dma.close(); self.adc.close()
 
     def configure(self, **kw):
@@ -441,6 +551,183 @@ class Engine:
     def trigger(self):
         """Arm exactly one capture, whatever the current run state."""
         self.configure(trigger=True)
+
+    # ---- phase noise
+    PN_STR_KEYS = ("window", "cal_mode")
+    PN_INT_KEYS = ("enabled", "double_pass", "decim", "nperseg", "npts",
+                   "predecimate", "require_cal")
+    PN_CAL_POINTS = 1 << 12      # sampled from each capture into the ring
+    PN_CAL_CAP = 1 << 19         # ring capacity: ~128 captures of history
+
+    def pn_configure(self, **kw):
+        """Phase-noise settings. Separate from configure() because these are
+        floats and strings (fibre length, hybrid angle, window name) and the
+        capture config is deliberately int-only."""
+        with self.lock:
+            for k, v in kw.items():
+                if k not in self.pn_cfg:
+                    raise KeyError(f"unknown phase-noise setting {k!r}")
+                if k in self.PN_STR_KEYS:
+                    self.pn_cfg[k] = str(v)
+                elif k in self.PN_INT_KEYS:
+                    self.pn_cfg[k] = int(v)
+                else:
+                    self.pn_cfg[k] = float(v)
+            if self.pn_cfg["window"] not in ("hann", "blackmanharris",
+                                             "flattop", "boxcar"):
+                self.pn_cfg["window"] = "hann"
+            if self.pn_cfg["cal_mode"] not in ("auto", "hold", "nominal"):
+                self.pn_cfg["cal_mode"] = "auto"
+            if self.pn_cfg["enabled"]:
+                # a two-port interferogram needs both photodiodes from the
+                # SAME sample clock, which is what ch_sel=3 delivers
+                # (NOTES.md #33) -- nothing else can produce this measurement
+                self.cfg["channel"] = A.CH_BOTH
+        self._dirty.set()
+
+    def pn_recalibrate(self, clear=True):
+        """Throw away the accumulated ellipse and start again.
+
+        The right thing after anything that moves the operating point or the
+        fringe amplitude: touching the fibre, changing laser power, swapping
+        a photodiode. Stale points and fresh ones fitted together describe
+        neither.
+        """
+        with self._pn_lock:
+            if clear:
+                self._pn_acc_n = 0
+            self.pn_cal = None
+
+    def pn_tau(self):
+        c = self.pn_cfg
+        if c["tau_ns"] > 0:
+            return c["tau_ns"] * 1e-9
+        return PN.tau_from_length(c["length_m"], c["n_group"],
+                                  bool(c["double_pass"]))
+
+    def _pn_push_cal(self, xa, xb):
+        """Add a stride-sampled slice of this capture to the calibration ring.
+
+        Strided, not contiguous: what the conic needs is COVERAGE of the
+        fringe, and within one 67 ms record the operating point barely moves,
+        so a contiguous block and a strided one carry the same information --
+        but the strided one keeps a record's worth of amplitude statistics.
+        Coverage arrives across captures, as the interferometer drifts.
+        """
+        step = max(1, xa.size // self.PN_CAL_POINTS)
+        pts = np.column_stack((xa[::step][:self.PN_CAL_POINTS],
+                               xb[::step][:self.PN_CAL_POINTS])).astype(np.float32)
+        with self._pn_lock:
+            if self._pn_acc is None:
+                self._pn_acc = np.zeros((self.PN_CAL_CAP, 2), np.float32)
+            k = pts.shape[0]
+            n = self._pn_acc_n
+            if n + k <= self.PN_CAL_CAP:
+                self._pn_acc[n:n + k] = pts
+                self._pn_acc_n = n + k
+            else:
+                # FIFO: drop the oldest. Old points are not just surplus,
+                # they are wrong once the photodiode DC has drifted.
+                keep = self.PN_CAL_CAP - k
+                self._pn_acc[:keep] = self._pn_acc[self.PN_CAL_CAP - keep:]
+                self._pn_acc[keep:] = pts
+                self._pn_acc_n = self.PN_CAL_CAP
+
+    def _pn_calibration(self, cfg):
+        """The Cal to demodulate this capture with, under the current mode.
+
+        'auto' refits from the ring every time but only ADOPTS a fit that
+        passes its own checks -- a momentarily worse fit must not evict a
+        good calibration, or the readout would flicker between right and
+        wrong every time the operating point paused.
+        """
+        if cfg["cal_mode"] == "nominal":
+            return None                       # analyse() builds it per record
+        if cfg["cal_mode"] == "hold":
+            return self.pn_cal
+        with self._pn_lock:
+            n = self._pn_acc_n
+            pts = None if n < 4096 else self._pn_acc[:n].copy()
+        if pts is None:
+            return self.pn_cal
+        cal = PN.fit_ellipse(pts[:, 0], pts[:, 1])
+        if cal is not None and (cal.trustworthy or self.pn_cal is None):
+            self.pn_cal = cal
+        return self.pn_cal
+
+    def _pn_loop(self):
+        while not self._stop.is_set():
+            with self._pn_lock:
+                while self._pn_req is None and not self._stop.is_set():
+                    self._pn_cv.wait(timeout=0.5)
+                req = self._pn_req
+            if req is None:
+                continue
+            try:
+                xa, xb, fs, cfg = req
+                # Sign-extend ONCE, here, and use the same array for both the
+                # calibration ring and the analysis. Feeding the ring raw
+                # uint16 fits an ellipse in a coordinate system that WRAPS at
+                # code 0 (NOTES.md #27): every negative excursion jumps to
+                # ~16383, the Lissajous shatters into fragments, and the fit
+                # comes back with amplitudes of 10000 codes on a 2600-code
+                # fringe -- confidently, since fragments still admit a conic.
+                xa = A.to_signed(xa).astype(np.int16)
+                xb = A.to_signed(xb).astype(np.int16)
+                self._pn_push_cal(xa, xb)
+                cal = self._pn_calibration(cfg)
+                r = PN.analyse(
+                    xa, xb, fs, self.pn_tau(),
+                    cal=cal, cal_mode=cfg["cal_mode"], psi_deg=cfg["psi_deg"],
+                    decim=cfg["decim"], nperseg=cfg["nperseg"],
+                    window=cfg["window"], f_max=cfg["f_max_hz"],
+                    npts=cfg["npts"], predecimate=bool(cfg["predecimate"]),
+                    require_cal=bool(cfg["require_cal"]))
+                self.pn_sid += 1
+                r["sid"] = self.pn_sid
+                r["ts"] = time.time()
+                r["volt_scale"] = A.VOLT_SCALE
+                r["cal_points"] = self._pn_acc_n
+                self.pn = r
+            except Exception as e:
+                self.pn = {"error": f"{type(e).__name__}: {e}",
+                           "sid": self.pn_sid, "ts": time.time()}
+            finally:
+                with self._pn_lock:
+                    self._pn_req = None
+
+    def _pn_submit(self, chans, fs, cfg):
+        """Hand a dual-channel capture to the worker, if it is idle.
+
+        Idle-only, like the classifier: the analysis is slower than the
+        capture loop, and queueing would build an ever-growing backlog of
+        stale records. Skipping is the correct behaviour -- every record is
+        an equally valid sample of the same stationary process.
+        """
+        now = time.monotonic()
+        if now - self._pn_last < cfg["period_s"]:
+            return
+        with self._pn_lock:
+            if self._pn_req is not None:
+                return
+            self._pn_req = (chans["A"].copy(), chans["B"].copy(), fs, dict(cfg))
+            self._pn_last = now
+            self._pn_cv.notify()
+
+    def _dual_words(self, nwords):
+        """Landing buffer for an interleaved A/B read.
+
+        NOT Spectrum.stage: that is sized for max_samples SAMPLES, but a dual
+        capture is two 16-bit words per sample clock. Reading N samples of
+        dual data into it silently truncated to half the record at any
+        N > max_samples/2 -- ddr_read_into clips to len(out) and reports the
+        short count, so the spectrum was of half a record and nothing said
+        so. Phase noise made that visible: a record that stops halfway is a
+        step discontinuity in dphi.
+        """
+        if self._dual_stage is None or self._dual_stage.size < nwords:
+            self._dual_stage = np.empty(nwords, np.uint16)
+        return self._dual_stage
 
     # ---- the loop
     def _loop(self):
@@ -701,6 +988,11 @@ class Engine:
         rb = cfg.get("readback", -1)
         want = max(need, trace_n, rb) if rb > 0 else (N if rb == 0
                                                       else max(need, trace_n))
+        if self.pn_cfg["enabled"] and ch == A.CH_BOTH:
+            # phase noise needs every sample: the record length IS the
+            # frequency resolution (1/T), and a partial read would also put
+            # a discontinuity in the middle of the demodulated phase
+            want = N
         read_n = min(N, want)
         g = A.SAMPLE_GRANULARITY
         read_n = max(g, -(-read_n // g) * g)     # round UP to granularity
@@ -715,8 +1007,9 @@ class Engine:
             # every sample clock emits BOTH channels as one 32-bit word, so
             # the record is twice as many uint16 words
             nbytes = read_n * 4
-            n = self.dma.read_into(self.sp.stage, read_n * 2)
-            raw = self.sp.stage[:n]
+            buf = self._dual_words(read_n * 2)
+            n = self.dma.read_into(buf, read_n * 2)
+            raw = buf[:n]
             # vendor client: raw[2i] is channel A, raw[2i+1] is channel B
             chans = {"A": raw[0::2], "B": raw[1::2]}
             self.dual = {k: {"mean": float(A.to_signed(v).mean()),
@@ -726,6 +1019,9 @@ class Engine:
                          for k, v in chans.items() if v.size}
             # keep both, de-interleaved, so both can be analysed and drawn
             self._pending = {k: np.array(v, copy=True) for k, v in chans.items()}
+            if self.pn_cfg["enabled"] and self._pending["A"].size:
+                self._pn_submit(self._pending, A.sample_rate(sp_),
+                                dict(self.pn_cfg))
             n = read_n
             got = nbytes
         else:
@@ -907,6 +1203,10 @@ class Engine:
                 "avg_depth": self._acc_n,
             },
             "dual": self.dual,
+            "pn": {"enabled": bool(self.pn_cfg["enabled"]),
+                   "sid": self.pn_sid,
+                   "waiting": bool(self.pn_cfg["enabled"]
+                                   and ch != A.CH_BOTH)},
             "sys": self._sys_cache,
             "analysis": self._live_analysis(shown, bin_hz, fs, nfft, ch)
                         if cfg.get("classify") else None,
@@ -940,6 +1240,36 @@ class Engine:
             self.frame = blob
             self.new_frame.notify_all()   # wake every long-poll waiter
         self.err = None       # a completed capture clears any stale error
+
+
+def json_safe(o):
+    """Deep-convert a result dict to something json.dumps will accept.
+
+    The masked FSR nulls are NaN on purpose -- "the interferometer sees
+    nothing here" -- and JSON has no NaN. json.dumps' own options are both
+    wrong: allow_nan=True emits a bare `NaN` token that JSON.parse rejects,
+    and allow_nan=False raises rather than calling `default` (which fires
+    only for types json does not already know, and it knows float). So the
+    substitution has to happen before dumps is called. `null` is what a
+    canvas plot already knows to lift the pen for.
+    """
+    if isinstance(o, np.ndarray):
+        if o.dtype.kind == "f":
+            out = o.astype(object)
+            out[~np.isfinite(o)] = None
+            return out.tolist()
+        return o.tolist()
+    if isinstance(o, dict):
+        return {k: json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [json_safe(v) for v in o]
+    if isinstance(o, (np.floating, float)):
+        return float(o) if np.isfinite(o) else None
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    return o
 
 
 _memcache = [0, 0, 0.0]
@@ -1053,6 +1383,30 @@ class Handler(BaseHTTPRequestHandler):
                                     [k for k, _ in sorted(labels.items(),
                                                           key=lambda kv: kv[1])]))
             return self._send(200, body.encode(), "application/json")
+        if p == "/pn":
+            # Latest phase-noise result. Fetched on its own poll rather than
+            # ridden along on /frame: it updates at the worker's rate (~1 Hz
+            # or slower on a long record), not the capture rate, and it is
+            # ~40 kB of JSON that most viewers never open the tab for.
+            e = self.engine
+            r = e.pn
+            if r is None:
+                body = json.dumps({
+                    "pending": True,
+                    "enabled": bool(e.pn_cfg["enabled"]),
+                    "channel": e.cfg["channel"],
+                    "cfg": e.pn_cfg,
+                    "tau_s": e.pn_tau(),
+                    "cal_points": e._pn_acc_n,
+                })
+                return self._send(200, body.encode(), "application/json")
+            out = json_safe(r)
+            out["cfg"] = e.pn_cfg
+            out["channel"] = e.cfg["channel"]
+            out["enabled"] = bool(e.pn_cfg["enabled"])
+            out["cal_points"] = e._pn_acc_n
+            return self._send(200, json.dumps(out).encode(),
+                              "application/json")
         if p == "/limits":
             return self._send(200, json.dumps({
                 "granularity": A.SAMPLE_GRANULARITY,
@@ -1092,6 +1446,20 @@ class Handler(BaseHTTPRequestHandler):
                     os._exit(0)
             threading.Thread(target=_restart, daemon=True).start()
             return
+        if p == "/pn/control":
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                cfg = json.loads(self.rfile.read(n) or b"{}")
+                if cfg.pop("recalibrate", False):
+                    self.engine.pn_recalibrate()
+                self.engine.pn_configure(**cfg)
+                return self._send(200, json.dumps(
+                    {"ok": True, "cfg": self.engine.pn_cfg,
+                     "tau_s": self.engine.pn_tau()}).encode(),
+                    "application/json")
+            except Exception as e:
+                return self._send(400, json.dumps({"error": str(e)}).encode(),
+                                  "application/json")
         if p != "/control":
             return self._send(404, b"not found", "text/plain")
         n = int(self.headers.get("Content-Length", 0))
@@ -1220,11 +1588,30 @@ def main():
     ap.add_argument("--mock", action="store_true",
                     help="no hardware: synthetic 25 MHz tone, never opens"
                          " /dev/*. For UI/server development")
+    ap.add_argument("--mock-interferometer", action="store_true",
+                    help="mock a 3x3-coupler Michelson on channel 3 instead"
+                         " of the tone: two photocurrents from a laser of"
+                         " --mock-linewidth, for the phase-noise tab."
+                         " Implies --mock")
+    ap.add_argument("--mock-linewidth", type=float, default=50e3,
+                    help="Lorentzian FWHM the mock laser is built to have,"
+                         " in Hz (default 50k). The phase-noise tab should"
+                         " read this number back")
+    ap.add_argument("--mock-drift", type=float, default=40.0,
+                    help="fringes per second the mock operating point"
+                         " sweeps. 0 reproduces a stuck interferometer, the"
+                         " condition under which two photodiodes cannot be"
+                         " calibrated at all")
     a = ap.parse_args()
+    if a.mock_interferometer:
+        a.mock = True
 
     lock = None
     if a.mock:
         print("MOCK MODE - synthetic data, hardware untouched")
+        if a.mock_interferometer:
+            print(f"  interferometer: {a.mock_linewidth/1e3:g} kHz linewidth,"
+                  f" {a.mock_drift:g} fringes/s drift")
     else:
         lock, holder = acquire_single_instance(a.replace)
     if lock is None and not a.mock:
@@ -1239,8 +1626,15 @@ def main():
         return 1
 
     A._xfer_reap_stale()      # clear tmpfs files stranded by earlier crashes
-    eng = Engine(nsamples=a.nsamples, channel=a.channel, nfft=a.nfft,
-                 min_period=a.min_period, fast_dma=a.fast_dma, mock=a.mock)
+    eng = Engine(nsamples=a.nsamples,
+                 channel=A.CH_BOTH if a.mock_interferometer else a.channel,
+                 nfft=a.nfft,
+                 min_period=a.min_period, fast_dma=a.fast_dma,
+                 mock="interferometer" if a.mock_interferometer else a.mock,
+                 mock_opts=dict(dnu_hz=a.mock_linewidth,
+                                drift_hz=a.mock_drift))
+    if a.mock_interferometer:
+        eng.pn_configure(enabled=1)
     eng.start()
     Handler.engine = eng
     srv, port = bind_server(a.bind, a.port)

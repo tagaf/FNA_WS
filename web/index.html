@@ -28,6 +28,17 @@ h1 span{color:var(--accent)}
   border-radius:6px;padding:5px 14px;font:12px inherit;cursor:pointer}
 .tabbtn:hover{color:var(--fg)}
 .tabbtn.active{background:#12463f;border-color:#1d6b60;color:#b8fff4}
+.pnbanner{margin:0 0 12px;padding:9px 14px;border-radius:8px;font-size:12px;
+  border:1px solid #5c4a2b;background:#26200f;color:#f0c48e;line-height:1.5}
+.pnbanner.bad{border-color:#5c2b2b;background:#260f0f;color:#ffb4b4}
+.pnbanner.good{border-color:#2b5c3a;background:#12261a;color:#b6e9c4}
+.pnbanner b{color:#fff}
+.pnlegend{display:flex;gap:14px;flex-wrap:wrap;padding:0 12px 9px;
+  font-size:10.5px;color:var(--dim)}
+.pnlegend span{display:flex;align-items:center;gap:5px;white-space:nowrap}
+.pnlegend i{width:14px;height:2px;display:inline-block}
+.note{padding:8px 12px;color:var(--dim);font-size:10.5px;line-height:1.5;
+  border-top:1px solid #1a222e}
 .nfam{display:flex;align-items:flex-start;gap:8px;padding:5px 12px;
   border-bottom:1px solid #1a222e;font-size:11.5px}
 .nfam:last-child{border-bottom:0}
@@ -107,6 +118,7 @@ tr:last-child td{border-bottom:0}
 
 <div class="tabs">
   <button class="tabbtn active" data-tab="main">Main</button>
+  <button class="tabbtn" data-tab="pn">Phase noise</button>
   <button class="tabbtn" data-tab="diag">Diagnostics</button>
 </div>
 <div id="err"></div>
@@ -192,6 +204,104 @@ tr:last-child td{border-bottom:0}
   </div>
 </div>
 
+<div id="tabPn" class="tabpanel" style="display:none">
+  <div id="pnBanner" class="pnbanner" style="display:none"></div>
+  <div class="mainlayout">
+    <div class="plots">
+
+      <div class="card">
+        <h2><span>Frequency noise
+          <label class="chk"><input type="checkbox" id="pnShowDnu"> show S<sub>Δν</sub> (uncorrected)</label>
+          <label class="chk"><input type="checkbox" id="pnShowBeta" checked> β-separation line</label>
+        </span><em id="pnNuInfo">–</em></h2>
+        <canvas id="cPnNu" style="height:320px"
+          title="S_nu: the laser's instantaneous frequency-noise PSD, after dividing out the interferometer's 4 sin^2(pi f tau) response. Only the part above the beta-separation line broadens the linewidth."></canvas>
+      </div>
+
+      <div class="card">
+        <h2><span>Phase noise
+          <label class="chk"><input type="checkbox" id="pnShowDphi"> show S<sub>Δφ</sub> (differential)</label>
+        </span><em id="pnPhInfo">–</em></h2>
+        <canvas id="cPnPhi" style="height:280px"
+          title="S_phi is the laser's instantaneous phase noise; L(f) = S_phi/2 is the SSB phase noise. S_dphi is the raw demodulated differential phase - much smaller at low f, and NOT the same quantity."></canvas>
+      </div>
+
+      <div class="rowCA" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="card">
+          <h2><span>Calibration ellipse</span><em id="pnCalInfo">–</em></h2>
+          <canvas id="cPnLiss" style="height:260px"
+            title="The two photocurrents plotted against each other. With only two photodiodes this ellipse IS the calibration: it must be closed before any absolute number below can be believed."></canvas>
+        </div>
+        <div class="card">
+          <h2><span>Linewidth vs observation time</span><em id="pnLwInfo">–</em></h2>
+          <canvas id="cPnLw" style="height:260px"
+            title="FWHM from the beta-separation-line method, as a function of how low in Fourier frequency the integral starts. A linewidth without its integration limit is not a number."></canvas>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span>Differential phase Δφ(t)</span><em id="pnPhiInfo">–</em></h2>
+        <canvas id="cPnTrace" style="height:180px"
+          title="The demodulated phase across the record, min/max enveloped. Slope is drift; the thickness is the laser noise."></canvas>
+      </div>
+    </div>
+
+    <div class="rowCA">
+      <div class="card"><h2>Interferometer</h2>
+        <div class="ctl">
+          <label for="pnEnabled">Measurement</label>
+          <select id="pnEnabled" title="Turning this on switches the capture to Channel 3 (A+B from the same sample clock) - the only mode that gives two simultaneous photocurrents."></select>
+          <label for="pnLength">Delay fibre</label>
+          <input id="pnLength" type="number" step="0.1" min="0.1" value="10"
+                 title="Extra fibre in the long arm, in metres. A Michelson is double-pass, so 10 m of fibre is 20 m of path.">
+          <label for="pnGeom">Geometry</label>
+          <select id="pnGeom" title="Michelson (Faraday mirrors, light traverses the delay twice) or Mach-Zehnder (once)."></select>
+          <label for="pnNg">Group index</label>
+          <input id="pnNg" type="number" step="0.0001" value="1.4682"
+                 title="Fibre group index at the laser wavelength. 1.4682 for SMF-28 at 1550 nm. tau scales directly with it, and so does every absolute level.">
+          <label for="pnTau">Delay τ</label>
+          <input id="pnTau" type="number" step="0.1" min="0" value="0"
+                 title="Override the delay in ns directly (0 = compute it from the fibre length above). Use this if you have measured the FSR: tau = 1/FSR.">
+          <label>FSR</label>
+          <em id="pnFsr" style="font-family:var(--mono);font-size:11.5px">–</em>
+          <div class="btn"><button id="pnRecal" title="Discard the accumulated ellipse and start again. Do this after touching the fibre, changing laser power, or moving a photodiode.">⟲ Recalibrate</button></div>
+        </div>
+      </div>
+
+      <div class="card"><h2>Analysis</h2>
+        <div class="ctl">
+          <label for="pnCalMode">Calibration</label>
+          <select id="pnCalMode" title="auto: keep refitting the ellipse from accumulated drift. hold: freeze the one in use. nominal: skip the fit, assume the coupler's hybrid angle and take offsets/amplitudes from the signal extremes."></select>
+          <label for="pnRequire">Gate</label>
+          <select id="pnRequire" title="Whether to refuse results built on a calibration that failed its own checks. An under-determined ellipse still produces a smooth, plausible, WRONG linewidth."></select>
+          <label for="pnPsi">Nominal ψ</label>
+          <input id="pnPsi" type="number" step="1" value="120"
+                 title="Hybrid angle assumed by the nominal calibration. A 3x3 coupler gives ±120°.">
+          <label for="pnDecim">Decimation</label>
+          <select id="pnDecim" title="Applied to the quadrature pair before the arctangent. Auto keeps Nyquist comfortably above the usable band (1/2tau) and makes the demodulation ~10x cheaper."></select>
+          <label for="pnNperseg">Welch segment</label>
+          <select id="pnNperseg" title="Whole record = the finest resolution the record can buy (1/T), with no averaging. Shorter segments average, at proportionally coarser resolution. Log-binning already averages at high f, so the whole record is usually right."></select>
+          <label for="pnWindow">Window</label>
+          <select id="pnWindow" title="Hann is the standard choice. Blackman-Harris trades resolution for -92 dB sidelobes, worth it if drift is leaking into the low decades."></select>
+          <label for="pnFmax">Max Fourier f</label>
+          <input id="pnFmax" type="number" step="0.1" min="0" value="0"
+                 title="Upper analysis limit in MHz (0 = 1/2tau). The 1/sin^2 correction diverges at every multiple of the FSR, where the interferometer is blind.">
+          <label for="pnPre">Demodulation</label>
+          <select id="pnPre" title="Decimate the quadrature pair before the arctangent (fast, exact while the phase excursion is small) or run the arctangent at the full 250 MS/s (correct for any excursion, ~10x slower)."></select>
+        </div>
+      </div>
+
+      <div class="card"><h2>Result <em id="pnAge">–</em></h2>
+        <table id="tPnResult"></table>
+      </div>
+      <div class="card"><h2>Acquisition <em id="pnAcqInfo">–</em></h2>
+        <table id="tPnAcq"></table>
+        <div class="note" id="pnNote"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="tabDiag" class="tabpanel" style="display:none">
   <div class="diaglayout">
     <div class="card"><h2>GPU / CUDA</h2><table id="tGpu"></table></div>
@@ -226,7 +336,13 @@ document.querySelectorAll('.tabbtn').forEach(b=>b.addEventListener('click',()=>{
   b.classList.add('active');
   const t=b.dataset.tab;
   $('tabMain').style.display=t==='main'?'':'none';
+  $('tabPn').style.display=t==='pn'?'':'none';
   $('tabDiag').style.display=t==='diag'?'':'none';
+  pnActive=(t==='pn');
+  // /pn is ~40 kB of JSON that only this tab consumes, so it is polled only
+  // while the tab is on screen -- and polled immediately on arrival rather
+  // than up to a second later
+  if(pnActive){pnPollNow();}
 }));
 
 // ---- populate selectors
@@ -1103,6 +1219,361 @@ window.addEventListener('mouseup',e=>{
 });
 $('bZoomReset').addEventListener('click',()=>{fBounds=null;send({zoom:null})});
 cFreqEl.addEventListener('dblclick',()=>{fBounds=null;send({zoom:null})});
+
+
+// =====================================================================
+// PHASE NOISE TAB
+// ---------------------------------------------------------------------
+// The server does all the DSP (phasenoise.py); this is presentation plus
+// the controls. /pn is polled only while the tab is visible: it is ~40 kB
+// of JSON produced at the analysis worker's rate (~1 Hz at best, slower on
+// a long record), so riding it along on every /frame would be pure waste
+// for the majority of viewers who never open this tab.
+// =====================================================================
+let pnActive=false, pnData=null, pnSid=-1, pnTimer=null, pnBusy=false;
+const PN_C={nu:'#7ee787',dnu:'#5ea8f0',beta:'#f0a35e',phi:'#35d6c3',
+            dphi:'#5ea8f0',L:'#c39bf0',lw:'#7ee787',white:'#f0a35e'};
+
+opts($('pnEnabled'),[0,1],v=>v?'on — demodulate phase':'off',0);
+opts($('pnGeom'),[1,0],v=>v?'Michelson (double pass)':'Mach–Zehnder (single pass)',1);
+opts($('pnCalMode'),['auto','hold','nominal'],
+     v=>({auto:'auto — fit from accumulated drift',hold:'hold — freeze current fit',
+          nominal:'nominal — assume ψ, use extremes'})[v],'auto');
+opts($('pnRequire'),[1,0],
+     v=>v?'refuse untrusted calibration':'show provisional numbers',1);
+opts($('pnDecim'),[0,1,2,4,8,16,32,64,128],
+     v=>v?'÷'+v:'auto — from τ',0);
+opts($('pnNperseg'),[0,1048576,262144,65536,16384,4096],
+     v=>v?v.toLocaleString()+' pts':'whole record (finest 1/T)',0);
+opts($('pnWindow'),['hann','blackmanharris','flattop','boxcar'],
+     v=>({hann:'Hann',blackmanharris:'Blackman–Harris',
+          flattop:'flat top',boxcar:'rectangular'})[v],'hann');
+opts($('pnPre'),[1,0],
+     v=>v?'fast — decimate I/Q first':'full rate arctangent',1);
+
+// ---- controls -> /pn/control
+async function pnSend(o){
+  try{
+    const r=await fetch('/pn/control',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+    const j=await r.json();
+    if(j.tau_s)pnShowTau(j.tau_s);
+  }catch(e){}
+}
+function pnShowTau(tau){
+  $('pnFsr').textContent=tau>0
+    ? `τ ${(tau*1e9).toFixed(1)} ns · FSR ${eng(1/tau)}` : '–';
+}
+function pnGeometry(){
+  return {length_m:+$('pnLength').value||10, n_group:+$('pnNg').value||1.4682,
+          double_pass:+$('pnGeom').value, tau_ns:+$('pnTau').value||0};
+}
+['pnLength','pnNg','pnTau'].forEach(id=>
+  $(id).addEventListener('change',()=>pnSend(pnGeometry())));
+$('pnGeom').addEventListener('change',()=>pnSend(pnGeometry()));
+$('pnEnabled').addEventListener('change',e=>{
+  const on=+e.target.value;
+  // the server switches the capture to channel 3 on enable -- reflect that
+  // in the Main tab's selector rather than letting the two disagree
+  if(on)$('channel').value='3';
+  pnSend(Object.assign({enabled:on},pnGeometry()));
+  if(on)pnPollNow();
+});
+$('pnCalMode').addEventListener('change',e=>pnSend({cal_mode:e.target.value}));
+$('pnRequire').addEventListener('change',e=>pnSend({require_cal:+e.target.value}));
+$('pnPsi').addEventListener('change',e=>pnSend({psi_deg:+e.target.value||120}));
+$('pnDecim').addEventListener('change',e=>pnSend({decim:+e.target.value}));
+$('pnNperseg').addEventListener('change',e=>pnSend({nperseg:+e.target.value}));
+$('pnWindow').addEventListener('change',e=>pnSend({window:e.target.value}));
+$('pnPre').addEventListener('change',e=>pnSend({predecimate:+e.target.value}));
+$('pnFmax').addEventListener('change',e=>
+  pnSend({f_max_hz:(+$('pnFmax').value||0)*1e6}));
+$('pnRecal').addEventListener('click',()=>{
+  $('pnRecal').disabled=true;$('pnRecal').textContent='Recalibrating…';
+  pnSend({recalibrate:true}).then(()=>setTimeout(()=>{
+    $('pnRecal').disabled=false;$('pnRecal').textContent='⟲ Recalibrate';},900));
+});
+
+// ---- polling
+function pnPollNow(){if(pnTimer)clearTimeout(pnTimer);pnPoll()}
+async function pnPoll(){
+  if(pnBusy)return;
+  pnBusy=true;
+  try{
+    const r=await fetch('/pn',{cache:'no-store'});
+    if(r.ok){pnData=await r.json();pnRender(pnData)}
+  }catch(e){}
+  finally{
+    pnBusy=false;
+    // keep a slow heartbeat even off-tab so the enable state stays honest
+    pnTimer=setTimeout(pnPoll,pnActive?900:5000);
+  }
+}
+
+// ---- generic log-log plot ------------------------------------------------
+// x is log(frequency), y is dB. Nulls in the data are `null` (the masked FSR
+// blind spots), and the pen lifts over them rather than drawing a line
+// across a region where the interferometer measured nothing.
+const _pnB=new Map();
+function niceStep(range,want){
+  const raw=range/Math.max(1,want);
+  const p=Math.pow(10,Math.floor(Math.log10(raw)));
+  for(const m of [1,2,2.5,5,10])if(p*m>=raw)return p*m;
+  return p*10;
+}
+function drawLogLog(cvId,series,opt){
+  const {c,w,h}=setup($(cvId));
+  const fin=[];let xLo=Infinity,xHi=0;
+  series.forEach(s=>{for(let i=0;i<s.f.length;i++){
+    const v=s.v[i];
+    if(s.f[i]>0){if(s.f[i]<xLo)xLo=s.f[i];if(s.f[i]>xHi)xHi=s.f[i]}
+    if(v!=null&&isFinite(v)&&!s.noscale)fin.push(v);
+  }});
+  if(!fin.length||!(xHi>xLo)){
+    axes(c,w,h,[],[]);c.fillStyle='#5f7188';c.font='11px ui-monospace,monospace';
+    c.textAlign='center';c.fillText(opt.empty||'no data',w/2,h/2);return null;
+  }
+  fin.sort((a,b)=>a-b);
+  let lo=fin[Math.floor(fin.length*0.01)],hi=fin[fin.length-1];
+  const pad=Math.max(3,(hi-lo)*0.08);lo-=pad;hi+=pad;
+  const st=ema(_pnB.get(cvId),lo,hi,0.35);_pnB.set(cvId,st);
+  lo=st.lo;hi=st.hi;
+  const lx0=Math.log10(xLo),lx1=Math.log10(xHi);
+  const xt=logTicks(xLo,xHi).map(v=>({p:(Math.log10(v)-lx0)/(lx1-lx0),
+                                      l:opt.xfmt?opt.xfmt(v):axFreq(v)}));
+  const step=niceStep(hi-lo,6),y0=Math.ceil(lo/step)*step,yt=[];
+  for(let v=y0;v<=hi;v+=step)yt.push({p:(v-lo)/(hi-lo),
+    l:(opt.yfmt?opt.yfmt(v):v.toFixed(step<1?1:0))});
+  const g=axes(c,w,h,xt,yt);
+  const X=f=>g.x0+g.pw*(Math.log10(f)-lx0)/(lx1-lx0);
+  const Y=v=>g.y0+g.ph*(1-(v-lo)/(hi-lo));
+  series.forEach(s=>{
+    c.strokeStyle=s.color;c.lineWidth=s.width||1.25;
+    c.setLineDash(s.dash||[]);
+    c.beginPath();let pen=false;
+    for(let i=0;i<s.f.length;i++){
+      const v=s.v[i];
+      if(v==null||!isFinite(v)||s.f[i]<=0){pen=false;continue}
+      const x=X(s.f[i]),y=Y(Math.max(lo-50,Math.min(hi+50,v)));
+      pen?c.lineTo(x,y):c.moveTo(x,y);pen=true;
+    }
+    c.stroke();c.setLineDash([]);
+  });
+  if(opt.ylabel){
+    c.save();c.translate(11,h/2);c.rotate(-Math.PI/2);
+    c.fillStyle='#5f7188';c.font='10px ui-monospace,monospace';
+    c.textAlign='center';c.fillText(opt.ylabel,0,0);c.restore();
+  }
+  return {X,Y,g,lo,hi};
+}
+function pnLegend(el,items){
+  $(el).innerHTML=items.map(i=>
+    `<span><i style="background:${i.c};${i.d?'height:0;border-top:2px dashed '+i.c:''}"></i>${i.t}</span>`
+  ).join('');
+}
+const dB=a=>a==null?null:(a>0?10*Math.log10(a):null);
+const dBs=a=>a?a.map(dB):[];
+
+// ---- the four plots ------------------------------------------------------
+function pnDrawSpectra(d){
+  const showDnu=$('pnShowDnu').checked, showBeta=$('pnShowBeta').checked;
+  const nu=[{f:d.f,v:dBs(d.S_nu),color:PN_C.nu,width:1.4}];
+  if(showDnu)nu.push({f:d.f,v:dBs(d.S_dnu),color:PN_C.dnu});
+  if(showBeta)nu.push({f:d.f,v:dBs(d.beta_line),color:PN_C.beta,dash:[5,4],
+                       noscale:true});
+  drawLogLog('cPnNu',nu,{ylabel:'dB re 1 Hz²/Hz'});
+  $('pnNuInfo').textContent=`${eng(d.f[0])} … ${eng(d.f_max_hz)}`;
+
+  const ph=[{f:d.f,v:dBs(d.S_phi),color:PN_C.phi,width:1.4},
+            {f:d.f,v:dBs(d.L),color:PN_C.L}];
+  if($('pnShowDphi').checked)ph.push({f:d.f,v:dBs(d.S_dphi),color:PN_C.dphi});
+  drawLogLog('cPnPhi',ph,{ylabel:'dB re 1 rad²/Hz  ·  L in dBc/Hz'});
+  $('pnPhInfo').textContent=`Δf ${eng(d.res_hz)} · ${d.navg}× avg`;
+}
+
+function pnDrawLissajous(d){
+  const {c,w,h}=setup($('cPnLiss'));
+  const cal=d.cal||{}, sc=(d.volt_scale||1.75/8192)*1000;
+  const x=d.liss_x||[],y=d.liss_y||[];
+  if(!x.length){axes(c,w,h,[],[]);return}
+  // equal mV per pixel on both axes, each centred on its own channel, so the
+  // ellipse's real shape (and how far round it the data got) is visible
+  let a=Math.max(cal.a1||0,cal.a2||0);
+  if(!(a>0))a=Math.max(...x.map(Math.abs),...y.map(Math.abs))||1;
+  const R=a*1.45, cx=cal.dc1||0, cy=cal.dc2||0;
+  const t=[0,.25,.5,.75,1];
+  const g=axes(c,w,h,
+    t.map(p=>({p,l:((cx-R+2*R*p)*sc).toFixed(0)})),
+    t.map(p=>({p,l:((cy-R+2*R*p)*sc).toFixed(0)})));
+  const X=v=>g.x0+g.pw*(v-(cx-R))/(2*R), Y=v=>g.y0+g.ph*(1-(v-(cy-R))/(2*R));
+  c.fillStyle='rgba(126,231,135,.55)';
+  for(let i=0;i<x.length;i++)c.fillRect(X(x[i])-1,Y(y[i])-1,2,2);
+  if(cal.a1>0&&cal.a2>0){
+    const psi=(cal.psi_deg||120)*Math.PI/180;
+    c.strokeStyle=cal.trustworthy?'#35d6c3':'#f06a6a';c.lineWidth=1.3;
+    c.beginPath();
+    for(let i=0;i<=180;i++){const p=i/180*2*Math.PI;
+      const px=X(cal.dc1+cal.a1*Math.cos(p)),py=Y(cal.dc2+cal.a2*Math.cos(p+psi));
+      i?c.lineTo(px,py):c.moveTo(px,py)}
+    c.closePath();c.stroke();
+  }
+  c.fillStyle='#5f7188';c.font='10px ui-monospace,monospace';
+  c.textAlign='center';c.fillText('PD A (mV)',g.x0+g.pw/2,h-7);
+  $('pnCalInfo').innerHTML=cal.a1
+    ? `${cal.source} · ${(100*cal.span).toFixed(0)}% of fringe · `
+      +`<span class="${cal.trustworthy?'v-good':'v-bad'}">`
+      +`${cal.trustworthy?'usable':'not usable'}</span>`
+    : '–';
+}
+
+function pnDrawLinewidth(d){
+  const fl=d.lw_f_lo||[],fw=d.lw_fwhm||[];
+  const pts=[],vals=[];
+  for(let i=0;i<fl.length;i++){
+    if(fl[i]>0&&fw[i]>0){pts.push(1/fl[i]);vals.push(dB(fw[i]))}
+  }
+  // x is observation time (= 1/f_lo), which is the quantity an operator
+  // thinks in; longer to the right, and the curve rises because 1/f noise
+  // keeps adding area as the integral reaches lower
+  const ser=[{f:pts,v:vals,color:PN_C.lw,width:1.5}];
+  if(d.lw_white_hz>0&&pts.length)
+    ser.push({f:[pts[0],pts[pts.length-1]],v:[dB(d.lw_white_hz),dB(d.lw_white_hz)],
+              color:PN_C.white,dash:[5,4]});
+  drawLogLog('cPnLw',ser,{ylabel:'FWHM',xfmt:v=>fmtDur(v),
+    yfmt:v=>{const hz=Math.pow(10,v/10);
+      return hz>=1e6?(hz/1e6).toFixed(1)+'M':hz>=1e3?(hz/1e3).toFixed(hz>=1e4?0:1)+'k':hz.toFixed(0)},
+    empty:'no frequency noise above the β line'});
+  $('pnLwInfo').textContent=d.f_beta_cross_hz
+    ? `β crossing ${eng(d.f_beta_cross_hz)}` : '–';
+}
+
+function pnDrawTrace(d){
+  const {c,w,h}=setup($('cPnTrace'));
+  const mn=d.dphi_min||[],mx=d.dphi_max||[];
+  if(!mn.length){axes(c,w,h,[],[]);return}
+  let lo=Infinity,hi=-Infinity;
+  for(let i=0;i<mn.length;i++){if(mn[i]<lo)lo=mn[i];if(mx[i]>hi)hi=mx[i]}
+  const pad=Math.max(1e-6,(hi-lo)*0.08);lo-=pad;hi+=pad;
+  const span=d.dphi_span_s||1,[tk,tu]=axTimeUnit(span);
+  const g=axes(c,w,h,
+    [0,.25,.5,.75,1].map(p=>({p,l:axNum(span*p*tk)+tu})),
+    [0,.25,.5,.75,1].map(p=>{const v=lo+(hi-lo)*p;
+      return {p,l:Math.abs(hi-lo)<0.2?(v*1e3).toFixed(0):v.toFixed(2)}}));
+  const Y=v=>g.y0+g.ph*(1-(v-lo)/(hi-lo));
+  c.beginPath();
+  for(let i=0;i<mx.length;i++){const x=g.x0+g.pw*i/(mx.length-1);
+    i?c.lineTo(x,Y(mx[i])):c.moveTo(x,Y(mx[i]))}
+  for(let i=mn.length-1;i>=0;i--)c.lineTo(g.x0+g.pw*i/(mn.length-1),Y(mn[i]));
+  c.closePath();c.fillStyle='rgba(53,214,195,.3)';c.fill();
+  c.strokeStyle=PN_C.phi;c.lineWidth=1;c.stroke();
+  $('pnPhiInfo').textContent=
+    `${(d.fringes_swept||0).toFixed(2)} fringes swept · `
+    +(Math.abs(hi-lo)<0.2?'mrad':'rad');
+}
+
+// ---- tables + banner -----------------------------------------------------
+const pnHz=v=>v==null||!isFinite(v)?'–'
+  :Math.abs(v)>=1e6?(v/1e6).toFixed(3)+' MHz'
+  :Math.abs(v)>=1e3?(v/1e3).toFixed(3)+' kHz':v.toFixed(1)+' Hz';
+
+function pnRender(d){
+  if(!d){return}
+  if(d.cfg){
+    pnShowTau(d.tau_s||0);
+    if(document.activeElement!==$('pnLength'))$('pnLength').value=d.cfg.length_m;
+    $('pnEnabled').value=String(d.cfg.enabled|0);
+  }
+  // --- banner: the one line that says whether to believe the numbers
+  const b=$('pnBanner');
+  const setB=(cls,html)=>{b.style.display='';b.className='pnbanner '+cls;
+                          b.innerHTML=html};
+  if(!d.enabled){
+    setB('','<b>Phase noise is off.</b> Turn the measurement on to switch the '
+      +'capture to Channel 3 — two photodiodes read on the same sample clock — '
+      +'and start demodulating the differential phase.');
+  }else if(d.channel!==3){
+    setB('bad','<b>Waiting for dual-channel data.</b> The capture is on channel '
+      +d.channel+'. Two simultaneous photocurrents are what makes this '
+      +'measurement possible; set Channel 3 on the Main tab.');
+  }else if(d.pending){
+    setB('','<b>Acquiring.</b> The first analysis lands after the next capture.');
+  }else if(d.error){
+    setB('bad','<b>No result:</b> '+d.error);
+  }else{
+    const c=d.cal||{},warn=(d.warn||[]);
+    if(warn.length)setB('',warn.map(w=>'• '+w).join('<br>'));
+    else setB('good',`<b>${pnHz(d.lw_white_hz)}</b> Lorentzian linewidth from the `
+      +`white frequency-noise floor, and <b>${pnHz(d.lw_fwhm&&d.lw_fwhm[0])}</b> `
+      +`integrated from ${fmtDur(1/(d.lw_f_lo?d.lw_f_lo[0]:1))} of observation. `
+      +`Calibration: ${(100*c.span).toFixed(0)}% of a fringe, halves agree `
+      +`to ${(100*(c.stability||0)).toFixed(3)}%.`);
+  }
+  if(d.pending||d.error||!d.f){
+    fill($('tPnResult'),[['status',d.pending?'acquiring':'no result']]);
+    fill($('tPnAcq'),[['calibration points',(d.cal_points||0).toLocaleString()]]);
+    if(d.cal)pnDrawLissajous({cal:d.cal,liss_x:[],liss_y:[]});
+    return;
+  }
+  pnDrawSpectra(d);pnDrawLissajous(d);pnDrawLinewidth(d);pnDrawTrace(d);
+  pnLegend('pnNote',[]);
+  const c=d.cal||{},sc=(d.volt_scale||1.75/8192)*1000;
+  const lwAt=t=>{ // FWHM integrated from f_lo = 1/t
+    if(!d.lw_f_lo||!d.lw_f_lo.length)return null;
+    const f=1/t;if(f<d.lw_f_lo[0])return null;
+    for(let i=0;i<d.lw_f_lo.length;i++)if(d.lw_f_lo[i]>=f)return d.lw_fwhm[i];
+    return null;
+  };
+  fill($('tPnResult'),[
+    ['linewidth (white / Lorentzian)',pnHz(d.lw_white_hz),'v-good'],
+    ['— over the whole record',pnHz(d.lw_fwhm&&d.lw_fwhm[0])],
+    ['— over 1 ms',pnHz(lwAt(1e-3))],
+    ['— over 10 ms',pnHz(lwAt(1e-2))],
+    ['S<sub>ν</sub> white floor',(d.lw_h0||0).toPrecision(4)+' Hz²/Hz'],
+    ['β-line crossing',pnHz(d.f_beta_cross_hz)],
+    ['Δφ rms (detrended)',(d.dphi_rms*1e3).toFixed(2)+' mrad'],
+    ['Δν rms',pnHz(d.dnu_rms_hz)],
+    ['apparent drift',pnHz(d.drift_hz_per_s)+'/s'],
+    ['fringes swept in record',(d.fringes_swept||0).toFixed(2)],
+    ['cycle-slip candidates',String(d.slips||0),d.slips?'v-warn':'v-good'],
+  ]);
+  fill($('tPnAcq'),[
+    ['τ (delay)',(d.tau_s*1e9).toFixed(2)+' ns'],
+    ['FSR = 1/τ',pnHz(d.fsr_hz)],
+    ['record',fmtDur(d.record_s)+' · '+(d.nsamples||0).toLocaleString()+' pts'],
+    ['resolution Δf',pnHz(d.res_hz)],
+    ['analysed band',pnHz(d.f[0])+' … '+pnHz(d.f_max_hz)],
+    ['decimation / demod rate','÷'+d.decim+' · '+eng(d.fs_demod_hz)],
+    ['Welch',d.navg+'× '+(d.nperseg||0).toLocaleString()+' pt '+d.window],
+    ['arctangent',d.predecimate?'after decimation':'full rate'],
+    ['calibration',c.source+' · '+(c.npts||0).toLocaleString()+' pts'],
+    ['— ψ (hybrid angle)',(c.psi_deg||0).toFixed(1)+'°'],
+    ['— fringe amplitudes',(c.a1*sc).toFixed(0)+' / '+(c.a2*sc).toFixed(0)+' mV'],
+    ['— offsets',(c.dc1*sc).toFixed(0)+' / '+(c.dc2*sc).toFixed(0)+' mV'],
+    ['— residual',(c.resid||0).toFixed(4)],
+    ['— fringe coverage',(100*c.span).toFixed(0)+'%'],
+    ['— half-to-half spread',c.stability==null||!isFinite(c.stability)
+      ? 'not verifiable' : (100*c.stability).toFixed(3)+'%',
+     c.trustworthy?'v-good':'v-bad'],
+    ['ring points',(d.cal_points||0).toLocaleString()],
+  ]);
+  $('pnAge').textContent='#'+(d.sid||0);
+  $('pnAcqInfo').textContent=d.enabled?'live':'off';
+  $('pnNote').innerHTML=
+    `Two photodiodes, not three: the 120° hybrid cannot be un-mixed linearly, `
+    +`so ψ and both channels' offsets and amplitudes come from fitting the `
+    +`ellipse above. It is only determined once the operating point has `
+    +`travelled round the fringe, which is why calibration accumulates across `
+    +`captures rather than being read off one — and why the check that gates `
+    +`these numbers is whether the first and second halves of that history `
+    +`fit the <em>same</em> ellipse. Coverage alone cannot be the check: a `
+    +`short arc is fitted happily by a wrong ellipse that then reports full `
+    +`coverage. Below roughly a kilohertz the `
+    +`plot is the <em>interferometer's</em> thermal and acoustic noise, not `
+    +`the laser's.`;
+}
+['pnShowDnu','pnShowBeta','pnShowDphi'].forEach(id=>
+  $(id).addEventListener('change',()=>{if(pnData&&pnData.f)pnDrawSpectra(pnData)}));
+pnPoll();
 
 window.addEventListener('resize',()=>{});
 poll();

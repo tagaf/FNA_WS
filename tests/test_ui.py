@@ -54,6 +54,66 @@ for cid in ("channel", "nsamples", "speed", "nfft", "max_frames", "avg",
     chk(f"control '{cid}' is in CTL_IDS or handled",
         f"'{cid}'" in js, "")
 
+# phase-noise controls, same rule. Two wiring styles are in use -- a direct
+# $('id').addEventListener and a ['a','b'].forEach(id=>$(id).addEventListener)
+# for the group that all send the same payload -- so accept either.
+bulk = set()
+for lst in re.findall(r"\[([^\]]*)\]\.forEach\(id=>\s*\n?\s*\$\(id\)\.addEventListener", js):
+    bulk |= set(re.findall(r"'([A-Za-z0-9_]+)'", lst))
+for cid in ("pnEnabled", "pnLength", "pnGeom", "pnNg", "pnTau", "pnCalMode",
+            "pnRequire", "pnPsi", "pnDecim", "pnNperseg", "pnWindow",
+            "pnFmax", "pnPre", "pnRecal"):
+    chk(f"phase-noise control '{cid}' is wired",
+        f"$('{cid}').addEventListener" in js or cid in bulk, "")
+
+# The static checks above cannot see a runtime error inside a draw function,
+# and no browser launches on this host (headless Chromium finds no usable
+# sandbox under the Jetson's AppArmor policy). test_pn_render.js runs the
+# real render path against a real /pn payload under a DOM stub instead.
+RENDER = os.path.join(HERE, "test_pn_render.js")
+if node and os.path.exists(RENDER):
+    import json, signal, subprocess as sp, time, urllib.request
+    print("\n  running the phase-noise render check (spins up --mock-interferometer)")
+    root = os.path.dirname(HERE)
+    proc = sp.Popen([sys.executable, os.path.join(root, "server.py"),
+                     "--mock-interferometer", "-n", "4194304", "-p", "8098"],
+                    stdout=sp.DEVNULL, stderr=sp.DEVNULL, cwd=root)
+    try:
+        d = None
+        for _ in range(90):
+            time.sleep(1)
+            try:
+                d = json.load(urllib.request.urlopen(
+                    "http://localhost:8098/pn", timeout=5))
+            except Exception:
+                continue
+            if d.get("f") and not d.get("error"):
+                break
+        chk("mock interferometer produced a phase-noise result",
+            bool(d and d.get("f")), (d or {}).get("error") or "")
+        if d and d.get("f"):
+            # the mock is built to a 50 kHz Lorentzian; the whole chain is
+            # only working if that number comes back out of it
+            got = d.get("lw_white_hz") or 0
+            chk("recovered linewidth matches the mock's 50 kHz",
+                0.8 < got / 50e3 < 1.25, f"{got/1e3:.1f} kHz")
+            with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                             delete=False) as fh:
+                json.dump(d, fh)
+                pnjson = fh.name
+            r = sp.run([node, RENDER, HTML, pnjson], capture_output=True,
+                       text=True)
+            print("\n".join("  " + l for l in r.stdout.strip().splitlines()))
+            chk("phase-noise render checks", r.returncode == 0,
+                r.stderr.strip()[:200])
+            os.unlink(pnjson)
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=25)
+        except Exception:
+            proc.kill()
+
 print()
 if fails:
     print("FAILURES:")
