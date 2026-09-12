@@ -1316,3 +1316,42 @@ words; `burst_cnt` only saturates to drive the done flag). Still missing:
 Adding a write-pointer register plus a continuous mode is a much smaller
 change than building ring buffering from scratch. It still needs a rebuild,
 and the -2.533 ns timing failure (section 29) should be closed first.
+
+## 35. AD9643 datasheet received -- one confirmation, one 2x error
+
+Datasheet at `~/pcie_fpga_project/ad9643 (4).pdf` (Rev. G).
+
+**Confirmed: two's complement is the power-up DEFAULT.** Register 0x14
+(Output mode) has default 0x05, whose bits [1:0] = 01 = "twos complement
+(default)"; Table 11 is even headed "Twos Complement Mode (Default)". So
+section 27's empirical finding is right, and -- importantly -- the FPGA does
+not need to configure anything to get it. Which is just as well, because it
+cannot (see below).
+
+**Corrected: volts per code was a factor of two out.** Table 11 gives
+
+    VIN+ - VIN- = -0.875 V  ->  -8192
+                   0        ->      0
+                  +0.875 V  ->  +8191
+
+so 8192 codes = 0.875 V PEAK; the "1.75 V p-p input span" is the full
+differential swing. The vendor client uses `ADC_FS_VOLTAGE/ADC_MAX_CODE` =
+1.75/8192 = 213.6 uV/code, which we copied. Correct value is
+**0.875/8192 = 106.8 uV/code**. Every voltage this tool has reported was 2x
+too large; codes, dBFS and all spectra are unaffected (dBFS normalises to
+8192 codes, not to volts). Fixed in ad9643.py and in the UI, including two
+hard-coded fallbacks.
+
+Also confirmed from the datasheet:
+* Input common mode 0.9 V, input span default 1.75 V p-p (register 0x18
+  default 0x00) -- so terminating an SMA to ground does put the input
+  outside the common-mode range, as suspected in section 23.
+* The interleaved DDR output on one 14-bit LVDS bus is the part's normal
+  architecture ("the D0 to D13 pins represent both the channel A and channel
+  B LVDS output data"), so the FPGA's single-IDDRE1 scheme is right.
+* DCO-to-data skew t_SKEW = 0.4 / 0.7 / 1.0 ns (min/typ/max) against a 2 ns
+  unit interval at 250 Msps. The FPGA samples on the raw DCO edge with
+  IDELAY fixed at 0 and no phase shift, so it lands ~0.7 ns into a 2 ns eye
+  typically -- inside it, but off-centre and with nothing to recover drift.
+* The ADC has its own ramp test mode (register 0x0D = 1111) -- unreachable
+  here, which is why channel 0 has to be an FPGA counter.

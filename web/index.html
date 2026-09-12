@@ -476,7 +476,8 @@ let tBounds=null, fBounds=null, fHold=null;
 // 14-bit TWO'S COMPLEMENT: codes run -8192..+8191 (NOTES.md section 27).
 // 1.75 V full scale / 8192 codes, per the vendor client.
 const ADC_MIN=-8192, ADC_MAX=8191;
-let VOLT_SCALE=1.75/8192;
+// 8192 codes = 0.875 V peak (1.75 V p-p full swing), per AD9643 Table 11
+let VOLT_SCALE=0.875/8192;
 const mV=c=>c*VOLT_SCALE*1000;
 let tLock=false;                     // lock the time-domain Y to full scale
 function ema(prev,lo,hi,k){
@@ -531,7 +532,7 @@ function drawTime(m,T){
   $('tdInfo').innerHTML=traceLegend(T)
     + `${m.cfg.nsamples.toLocaleString()} pts · ${axNum(dur_s*tk)} ${tu}`
     + ` · shaded = min…max, line = mean`
-    + (tLock?` · full scale ±1.75 V`:' · autoscaled') + ' · mV';
+    + (tLock?` · full scale ±0.875 V`:' · autoscaled') + ' · mV';
 }
 
 // Spectrum: log frequency (x) × dB (y, already log-magnitude) = log-log for
@@ -1393,7 +1394,7 @@ function pnDrawSpectra(d){
 
 function pnDrawLissajous(d){
   const {c,w,h}=setup($('cPnLiss'));
-  const cal=d.cal||{}, sc=(d.volt_scale||1.75/8192)*1000;
+  const cal=d.cal||{}, sc=(d.volt_scale||0.875/8192)*1000;
   const x=d.liss_x||[],y=d.liss_y||[];
   if(!x.length){axes(c,w,h,[],[]);return}
   // equal mV per pixel on both axes, each centred on its own channel, so the
@@ -1516,7 +1517,7 @@ function pnRender(d){
   }
   pnDrawSpectra(d);pnDrawLissajous(d);pnDrawLinewidth(d);pnDrawTrace(d);
   pnLegend('pnNote',[]);
-  const c=d.cal||{},sc=(d.volt_scale||1.75/8192)*1000;
+  const c=d.cal||{},sc=(d.volt_scale||0.875/8192)*1000;
   const lwAt=t=>{ // FWHM integrated from f_lo = 1/t
     if(!d.lw_f_lo||!d.lw_f_lo.length)return null;
     const f=1/t;if(f<d.lw_f_lo[0])return null;

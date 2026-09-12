@@ -42,9 +42,17 @@ REG_FINISH   = 0x10   # R  bit0 = ddr_wr_finish
 # which sign-extends with ((int16_t)(x<<2))>>2 and scales by
 # ADC_FS_VOLTAGE/ADC_MAX_CODE. Reading the codes as unsigned makes a signal
 # near zero appear to jump between ~0 and ~16383 at every zero crossing.
-ADC_FS_VOLTS = 1.75            # full scale, single-ended equivalent
+# AD9643 datasheet Table 11 (two's complement, the power-up DEFAULT):
+#   VIN+ - VIN- = -0.875 V -> -8192
+#                  0       ->     0
+#                 +0.875 V -> +8191
+# so 8192 codes correspond to 0.875 V PEAK; "1.75 V p-p input span" is the
+# full differential swing. The vendor client uses 1.75/8192 and is therefore
+# a factor of two out; this uses the datasheet value.
+ADC_FS_VOLTS_PP = 1.75         # full-scale differential swing, peak-to-peak
+ADC_FS_VOLTS = ADC_FS_VOLTS_PP / 2.0         # 0.875 V peak
 ADC_MAX_CODE = 8192.0
-VOLT_SCALE = ADC_FS_VOLTS / ADC_MAX_CODE     # 213.6 uV per code
+VOLT_SCALE = ADC_FS_VOLTS / ADC_MAX_CODE     # 106.8 uV per code
 
 
 def to_signed(u):
