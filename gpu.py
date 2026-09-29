@@ -56,6 +56,8 @@ _l.adc_process.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
 _l.adc_process.restype = ctypes.c_int
 _l.adc_set_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
 _l.adc_set_window.restype = ctypes.c_int
+_l.adc_set_invert.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_l.adc_set_invert.restype = ctypes.c_int
 _l.adc_win_enbw.argtypes = [ctypes.c_void_p]
 _l.adc_win_enbw.restype = ctypes.c_float
 _l.adc_destroy.argtypes = [ctypes.c_void_p]
@@ -97,6 +99,7 @@ class Spectrum:
         self.stats = np.zeros(5, np.float32)
         self.times = np.zeros(5, np.float32)
         self.window = 0
+        self.invert = False
         self.enbw = float(_l.adc_win_enbw(self.h))
 
     @property
@@ -110,6 +113,17 @@ class Spectrum:
             return
         n = nbytes // 2
         np.copyto(self.host[:n], self.stage[:n])
+
+    def set_invert(self, on):
+        """Apply the ADC's output inversion (0x14 bit 2) inside the kernel.
+
+        MUST be cleared before processing the FPGA's internal test counter
+        (ChannelSel 0), which is generated in fabric and never passes through
+        the converter's inverter."""
+        if _l.adc_set_invert(self.h, 1 if on else 0) != 0:
+            raise RuntimeError("adc_set_invert failed")
+        self.invert = bool(on)
+        return self.invert
 
     def set_window(self, win):
         """win: name or id from WINDOWS. Rebuilds the window table and the

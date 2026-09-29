@@ -65,8 +65,6 @@ try:
     for N,nfft in [(4096,1024),(4096,4096),(262144,4096),(1048576,8192),
                    (1048576,65536),(16777216,65536)]:
         cases.append(dict(nsamples=N,nfft=nfft,speed=0,max_frames=1,trace_samples=4096))
-    for sp in (1,7):
-        cases.append(dict(nsamples=1048576,nfft=8192,speed=sp,max_frames=1,trace_samples=4096))
     for mf in (64,256):
         cases.append(dict(nsamples=1048576,nfft=8192,speed=0,max_frames=mf,trace_samples=4096))
     cases.append(dict(nsamples=1048576,nfft=8192,speed=0,max_frames=64,trace_samples=262144))
@@ -110,7 +108,7 @@ try:
         # axis draws, with the point index as a secondary sanity bound
         ok&=chk("disp_axis",abs(dfreq-fa)<=1.01*m["bin_hz"] or abs(di-kexp)<=2,
                 f"{dfreq/1e6:.4f} vs {fa/1e6:.4f} MHz (pt {di}/{kexp})")
-        tag=f"N={N} nfft={nfft} sp={cfg['speed']} mf={cfg['max_frames']} tr={cfg['trace_samples']}"
+        tag=f"N={N} nfft={nfft} mf={cfg['max_frames']} tr={cfg['trace_samples']}"
         print(f"{tag:<46}{fs/2/1e6:>9.2f}{m['sig']['peak_hz']/1e6:>10.3f}{dfreq/1e6:>10.3f}{'OK' if ok else 'FAIL':>4}")
 
     # trace follows the record by default
@@ -121,6 +119,19 @@ try:
         f"{m['acq']['trace_samples']}")
     print(f"trace default follows record: trace={m['acq']['trace_samples']:,} of N=1,048,576 "
           + ("OK" if m["acq"]["trace_samples"]==1048576 else "FAIL"))
+
+    # Speed_Set must be rejected, not silently accepted: it does not decimate
+    # and a non-zero value corrupts block lengths (spec 8.1). This used to be
+    # a UI dropdown offering 0..255.
+    for sp in (1, 7, 255):
+        try:
+            post({"speed": sp})
+            chk(f"Speed_Set={sp} rejected", False, "server accepted it")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            chk(f"Speed_Set={sp} rejected", e.code == 400 and "must be 0" in body,
+                f"HTTP {e.code}: {body[:60]}")
+    post({"speed": 0})          # 0 must still be accepted
 
     # zoom slice mapping
     post({"zoom":[20e6,30e6],"nsamples":1048576,"nfft":65536,"speed":0,"max_frames":8})
@@ -155,6 +166,32 @@ try:
     e2=json.loads(get("/status").read())["err"]
     chk("bad-channel-err","Channel_Set=4" in e1 and e2 is None,f"err1={e1[:60]!r} err2={e2!r}")
     print(f"channel=4 rejected then recovers: {'OK' if 'Channel_Set=4' in e1 and e2 is None else 'FAIL'}")
+
+    # nfft > nsamples must NOT wedge the engine.
+    # Reported as "the GUI hangs when I pick a short period": a client that
+    # shortens the record without also shortening the FFT leaves nfft > N,
+    # adc_process returns -1 on every iteration, the engine stops producing
+    # frames, and every connected UI sits on its last good frame looking
+    # frozen. _one() now clamps nfft down instead of failing. A client
+    # sending the two keys in separate requests (web/index.html does) passes
+    # through this state routinely, so it has to degrade, not wedge.
+    post({"nsamples":1<<20,"nfft":1<<20}); time.sleep(1.0)
+    post({"nsamples":4096})                     # nfft deliberately left huge
+    time.sleep(1.0)
+    f0=json.loads(get("/status").read())["frames"]
+    time.sleep(1.2)
+    s1=json.loads(get("/status").read())
+    advancing=s1["frames"]>f0
+    chk("short-record-no-wedge",advancing and not s1["err"],
+        f"frames {f0}->{s1['frames']} err={s1['err']!r}")
+    print(f"nfft>nsamples clamped, engine keeps running: "
+          f"{f0}->{s1['frames']} {'OK' if advancing and not s1['err'] else 'FAIL'}")
+    # and the clamp is reported honestly in the frame's own cfg
+    r=get("/frame"); b=r.read()
+    hl=struct.unpack("<I",b[:4])[0]; mm=json.loads(b[4:4+hl])
+    chk("clamped-nfft-reported",mm["cfg"]["nfft"]<=mm["cfg"]["nsamples"],
+        f"nfft={mm['cfg']['nfft']} nsamples={mm['cfg']['nsamples']}")
+    post({"nsamples":1<<20,"nfft":8192}); time.sleep(0.8)
 
     st=json.loads(get("/status").read())
     print(f"\ntimeouts={st['timeouts']}  residual err={st['err']}")

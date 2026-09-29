@@ -17,10 +17,14 @@ def main():
     p.add_argument("-o", "--out", help="write samples to .npy or .bin")
     p.add_argument("--fft", action="store_true", help="report the FFT peak")
     p.add_argument("--timeout", type=float, default=None)
+    p.add_argument("--tap", type=int, default=None,
+                   help="IDELAY tap to load first; default is the value stored "
+                        "by tools/eye_scan.py --save (the FPGA loses it on "
+                        "every reconfiguration)")
     a = p.parse_args()
 
     try:
-        with A.Adc() as adc:
+        with A.Adc(tap=a.tap) as adc:
             d = adc.capture(a.nsamples, channel=a.channel, speed=a.speed,
                             timeout=a.timeout)
             el = adc.elapsed

@@ -5,3 +5,10 @@ cuda/*.so
 bisect_marker.txt
 *.log
 native/xdma_shm_reader
+
+# Working snapshots taken before large edits (ad9643.py.pre02, etc.) and
+# scratch CSVs from diagnostic sweeps. Useful locally, noise in the history.
+*.pre[0-9][0-9]
+*.prestream
+*.prefix
+eye_scan.csv

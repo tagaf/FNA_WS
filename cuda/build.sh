@@ -11,9 +11,17 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-NVCC="${NVCC:-nvcc}"
-command -v "$NVCC" >/dev/null 2>&1 || NVCC=/usr/local/cuda/bin/nvcc
-[ -x "$NVCC" ] || { echo "nvcc not found -- set NVCC=/path/to/nvcc" >&2; exit 1; }
+# Resolve through PATH first, then the usual CUDA install. `[ -x "$NVCC" ]`
+# was checking a bare name as if it were a path, so whenever nvcc WAS on PATH
+# the script tested ./nvcc, found nothing, and refused to build.
+NVCC="${NVCC:-}"
+if [ -z "$NVCC" ]; then
+    NVCC="$(command -v nvcc 2>/dev/null || true)"
+fi
+[ -n "$NVCC" ] || NVCC=/usr/local/cuda/bin/nvcc
+command -v "$NVCC" >/dev/null 2>&1 || {
+    echo "nvcc not found -- set NVCC=/path/to/nvcc" >&2; exit 1; }
+echo "using $NVCC ($("$NVCC" --version | tail -1))"
 
 "$NVCC" -O3 -arch=sm_87 -shared -Xcompiler -fPIC -o libadcfft.so adcfft.cu -lcufft
 echo "built cuda/libadcfft.so"

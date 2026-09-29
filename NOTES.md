@@ -1355,3 +1355,215 @@ Also confirmed from the datasheet:
   typically -- inside it, but off-centre and with nothing to recover drift.
 * The ADC has its own ramp test mode (register 0x0D = 1111) -- unreachable
   here, which is why channel 0 has to be an FPGA counter.
+
+## 36. `/raw` served the wrong buffer in dual mode, 2026-09-20
+
+Chasing "same signal on both inputs, two sines of very different amplitude".
+The plotting path turned out to be clean, but the *diagnostic* path was not.
+
+`_dual_words()` (added with phase noise, section 34) moved the A+B readback
+out of `Spectrum.stage` into its own `_dual_stage`. The `/raw` snapshot a few
+lines below it was left sourcing `self.sp.stage` unconditionally. In A+B mode
+nothing writes `sp.stage` before that line, so `/raw` returned whatever the
+*previous* frame's trace loop last copied in -- channel B, alone, not the
+interleaved record.
+
+Everything that de-interleaves `/raw` was therefore splitting one channel's
+record even/odd and calling the halves A and B: `tools/channel_skew.py` (both
+its tests) and `diag_input.py`'s lag-1 interleave check. Measured on
+`--mock-interferometer`, where the two photocurrents are ~120 deg apart and
+must anti-correlate:
+
+    pre-fix    even mean +616.18 std 364.54   odd mean +616.17 std 364.50
+               corr(even,odd) = +0.9700        <- one channel, adjacent samples
+    post-fix   even mean +1039.32 std 376.90  odd mean +1499.65 std 306.37
+               corr(A,B)      = -0.9888        <- genuine A/B
+
+Fixed by sourcing the snapshot from the buffer the branch actually filled.
+
+**This retracts the "confirmed on hardware" half of section 33.** The HDL
+argument there still stands, and the measurement was valid when written
+(pre-`_dual_words`), but it has not been re-run against real interleaved data
+since. Re-run `tools/channel_skew.py` before citing it again.
+
+Also fixed: the dual-channel rows in the Signal panel tested `v.max>=16380 ||
+v.min<=2` for clipping, unsigned thresholds left over from before section 27.
+`self.dual` has been signed (-8192..8191) since then, so the test could never
+fire on a real rail and fired constantly on any signal crossing zero. Now
+`v.max>=8190 || v.min<=-8190`.
+
+Not explained by any of this: the amplitude difference itself. The A/B data
+path in `server.py` is byte-identical per channel (same de-interleave, same
+`to_signed`, same `Spectrum.process`, same wire scale, shared Y axis in the
+client), so what the plot shows is real. The open hardware candidates are
+section 26.4 / 35: both channels share one 14-bit LVDS bus, A recovered on the
+falling DCO edge and B on the rising, `IDELAY` fixed at 0, no MMCM phase
+shift, no bitslip or training, against t_SKEW 0.4/0.7/1.0 ns in a 2 ns UI --
+the two edges do not have equal margin by construction. Decisive tests:
+capture ch1 alone and ch2 alone and compare RMS (isolates dual mode from the
+LVDS capture), and swap the cables at the SMAs (isolates the board from the
+source).
+
+## 37. The HDL, read against the routed reports, 2026-09-20
+
+Sources now on this machine at `~/projects/fpga-pcie/pcie_fpga_project`.
+Cable swap and single-channel capture both put the small signal on ch2, so
+the cause is board-side. What the FPGA sources say:
+
+### 37.1 The ADC data bus is NOT timing-constrained. At all.
+
+`pcie_pin.xdc` has `create_clock` on `adc_clk_p` but **no `set_input_delay`
+on `adc_data_p[*]`**. Confirmed in the routed report's own check_timing:
+
+    5. checking no_input_delay (16)
+     There are 16 input ports with no input delay specified. (HIGH)
+
+So the pad-to-IDDRE1 capture -- the thing that decides whether either channel
+is sampled in its data eye -- is never analysed. The `adc_clk_p[0]` domain
+reporting WNS +0.526 / WHS +0.036 says nothing about it; those are fabric
+paths only. Every "timing met" claim about this design excludes the one path
+that matters for data integrity.
+
+### 37.2 The DCO goes through a plain BUFG: ~3.3-3.8 ns of insertion, 2 ns UI
+
+`ad9643_md.v`: `IBUFDS -> BUFG CLK_B0 -> adc_clk`, no MMCM, no phase shift.
+From the routed report, pad to `rxdata_bus[5].IDDRE1_inst/CLK`:
+
+    falling edge  0.503 + 0.090 + 0.750 + 0.083 + 2.399 = 3.825 ns
+    rising  edge  0.306 + 0.051 + 0.649 + 0.075 + 2.177 = 3.258 ns
+                                     (DIFFINBUF, route, BUFGCE, clock net)
+
+against a **2 ns unit interval** at 250 Msps. The data path is pad -> IBUFDS
+-> IDELAYE3 -> IDDR D inside the same bitslice, a few hundred ps. The clock
+therefore arrives ~1.6-1.9 UI after the data it is meant to sample. This
+works at all only because the relationship happens to wrap to a usable point
+modulo the UI -- it was never placed there on purpose.
+
+Nothing recovers it: `IDELAYE3` is `DELAY_TYPE("FIXED")`, `DELAY_VALUE(0)`,
+`CE`/`LOAD` tied 0 (so not even runtime-adjustable), no bitslip, no training
+pattern. Datasheet t_SKEW is 0.4/0.7/1.0 ns min/typ/max -- a 600 ps spread
+inside a 2 ns eye, before any of the above.
+
+### 37.3 Why this can hit ONE channel: the two share a bus, not an instant
+
+The AD9643 interleaves both channels on the one 14-bit LVDS bus, and
+`ad9643_md.v` separates them purely by clock edge:
+
+    IDDRE1 Q1 -> adc_data_b_d0 -> ad_in2 -> ch_sel = 2   (rising edge)
+    IDDRE1 Q2 -> adc_data_a_d0 -> ad_in1 -> ch_sel = 1   (falling edge)
+
+(confirmed in the routed report: `IDDRE1_inst/Q[1]` drives `adc_data_pn_a`
+with source clock edge `f`.)
+
+So the channels differ by exactly one thing -- which edge of `adc_clk`
+samples the bus. Any rise/fall asymmetry in DIFFINBUF + route + BUFG + the
+global clock net lands entirely as a difference BETWEEN THE CHANNELS, and
+`create_clock -waveform {0.000 2.000}` tells the tool the DCO is a perfect
+50% square wave, so no duty-cycle distortion is modelled or compensated
+anywhere. A mechanism that degrades one channel and not the other, fixed in
+silicon, immune to swapping cables: which is the reported symptom.
+
+Do NOT read the 567 ps rise/fall delta above as a DCD measurement -- those
+are corner-pessimised setup numbers, not a duty-cycle figure. The point is
+that the asymmetry is unbounded and unchecked, not that it is 567 ps. Which
+channel loses has to be measured.
+
+### 37.4 Wrong IDDR mode for a fabric re-register
+
+`DDR_CLK_EDGE("OPPOSITE_EDGE")` leaves Q1 and Q2 half a cycle apart, and both
+are then re-registered on `posedge adc_clk`. ch1 (Q2, falling launch) gets a
+**half-cycle** internal path -- the report shows Requirement 2.000ns, slack
++0.574 -- while ch2 (Q1) gets the full 4 ns. It is MET today, so it is not the
+current fault, but it is half the margin for no reason.
+`SAME_EDGE_PIPELINED` exists precisely to realign both to the rising edge.
+
+### 37.5 Smaller things
+
+* The ILA is miswired: `wire [47:0] probe0` gets only 28 bits
+  (`{adc_data_a_d0, adc_data_b_d0}`); the top 20 are undriven, and the
+  instantiation comment claims `[31:0]`. This is the best on-board
+  diagnostic available (`/dev/xdma0_xvc` + Vivado Hardware Manager) and it
+  does not probe what it says it does.
+* `adc_clk_op` -- the 250 MHz sample clock the FPGA GENERATES for the ADC
+  (clk_wiz_0 CLKOUT1, phase 0) -- has no `create_generated_clock` and no
+  output delay. It is one of the 2 `no_output_delay` ports.
+* `speed_ctrl`'s `adc_data_en` still never gates `ad_out` (section 26.1).
+
+### 37.6 But measure before rebuilding: the ADA4932-2 is at least as likely
+
+The front end is an ADA4932-2 dual differential driver; its closed-loop gain
+is set by external Rf/Rg per half. A resistor tolerance or a stuffing error
+gives a constant amplitude ratio that follows the channel and survives a
+cable swap -- the same symptom -- and a clean scaled sine is much more
+characteristic of an analog gain error than of a capture error, which
+corrupts individual bits rather than scaling anything.
+
+`tools/channel_gain.py` separates them from data the board can produce now:
+
+    ANALOG gain error   ratio CONSTANT across input levels; the absolute
+                        noise floor IN CODES is the SAME on both channels
+                        (the converter's own noise does not move when the
+                        signal shrinks); per-bit stats match.
+    CAPTURE error       ratio varies with level; ch2's noise floor in codes
+                        is RAISED; spurs/THD worse; per-bit toggle rates
+                        diverge.
+
+Note SINAD is NOT the discriminator -- a genuine 2x gain error costs the
+quiet channel ~6 dB of SINAD all by itself, because the floor stays put while
+the signal halves. The floor in codes is what a gain error cannot move.
+
+If it comes out ANALOG, none of 37.1-37.4 is the cause; measure Rf/Rg on both
+halves. If it comes out CAPTURE, the fix is a rebuild: add `set_input_delay`
+for the bus, put an MMCM on the DCO with a tuned phase shift (or
+`DELAY_TYPE("VAR_LOAD")` and a real eye scan), and move to
+`SAME_EDGE_PIPELINED`.
+
+### 37.7 Correction: the ratio is ~10x, which rules the FPGA out
+
+Measured difference is about **ten times** (~20 dB). That eliminates
+everything in 37.1-37.4 as the cause, for two independent reasons:
+
+* **10 is not a power of two.** Every digital mechanism available in this
+  data path -- a shifted bit lane, a dropped LSB, a misaligned de-interleave,
+  a sign-extension error -- can only scale by 2^n. There is no digital
+  operation anywhere between the ADC pins and `to_signed()` that multiplies
+  by 10.
+* **A capture error does not scale a signal at all.** Sampling off the data
+  eye corrupts individual bits, which RAISES the noise floor and adds spurs;
+  it does not produce a clean sine at 1/10 amplitude. To get a clean 10x you
+  need something that is genuinely linear, i.e. analog.
+
+37.1-37.4 stay in this file because they are real and will bite later (an
+unconstrained source-synchronous bus at 250 Msps is not something to leave
+alone), but they are **not this bug**. The cause is in front of the ADC.
+
+~20 dB, flat, following the channel and surviving a cable swap, points at the
+ADA4932-2 front end. In rough order of likelihood:
+
+1. **ch2's own path is dead and what is visible is ch1 leaking across.**
+   -20 dB is far too much for the AD9643's own channel isolation (datasheet
+   is ~-90 dB at low frequency), so it would have to be a resistive leak --
+   e.g. signal reaching the ADC pin through an unpowered or failed ADA4932
+   half's feedback network. Fits "same frequency, ~10x down, follows the
+   channel" exactly.
+2. **Gain-setting resistor difference.** ADA4932 gain is Rf/Rg per half; 10x
+   is Rg 100R vs 1k, or Rf 1k vs 100R. A stuffing/BOM error -- or a
+   DELIBERATE asymmetry (a x1 wideband channel and a x10 channel is a common
+   board design). 20 dB is a suspiciously round number for a random fault.
+3. **Termination / divider difference** on the ch2 input.
+4. **A failed or unpowered ADA4932 half** -- signal arrives only through the
+   passive network, giving flat attenuation.
+
+Three bench tests, each under a minute, in this order:
+
+* **Drive ch2 ONLY, ch1 disconnected.** Still ~1/10? Its path is alive but
+  attenuated -> gain network (2/3). Nothing at all? Its path is dead and what
+  was being measured was ch1 crosstalk (1/4). This single test splits the
+  list in half.
+* **Disconnect ch1, keep ch2 driven** (the mirror) to confirm.
+* **Sweep the tone frequency.** A resistive gain/divider error is FLAT with
+  frequency. Capacitive crosstalk RISES ~6 dB/octave. Instant separation.
+
+Then measure Rf/Rg on both halves with the board unpowered.
+`tools/channel_gain.py` gives the exact ratio and the per-channel noise floor
+in codes if a precise number is wanted, but the bench tests above decide it.

@@ -48,8 +48,60 @@ ids_decl = set(re.findall(r'id="([A-Za-z0-9_]+)"', src))
 missing = sorted(ids_used - ids_decl)
 chk("every $('id') exists in the markup", not missing, ", ".join(missing))
 
+# Every function the script CALLS must be defined. A block-replacing edit once
+# deleted hwRow/hwHex/hwRefresh while leaving the call sites, so entering the
+# ADC/FPGA tab threw ReferenceError and the whole tab came up blank -- which no
+# id-existence or brace-balance check catches.
+def _strip_js(src):
+    """Remove comments and string literals so the scan sees only code."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i+1] == "/":
+            i = src.find("\n", i)
+            if i < 0:
+                break
+        elif c == "/" and i + 1 < n and src[i+1] == "*":
+            i = src.find("*/", i)
+            i = n if i < 0 else i + 2
+        elif c in "'\"`":
+            q, i = c, i + 1
+            while i < n and src[i] != q:
+                i += 2 if src[i] == "\\" else 1
+            i += 1
+            out.append(' ')
+        else:
+            out.append(c); i += 1
+    return "".join(out)
+
+
+_code = _strip_js(js)
+_BUILTIN = set("""if else for while switch case catch try return typeof new
+    delete void in of do fetch parseInt parseFloat Number String Boolean Array
+    Object Math JSON setTimeout setInterval clearInterval clearTimeout
+    requestAnimationFrame isNaN isFinite alert confirm prompt Blob Date Promise
+    Map Set RegExp Error console document window navigator performance
+    encodeURIComponent decodeURIComponent structuredClone queueMicrotask
+    function async await getContext""".split())
+_called = set(re.findall(r"(?<![.\w$])([A-Za-z_][A-Za-z0-9_]*)\s*\(", _code))
+_defined = set(re.findall(r"function\s+([A-Za-z_][A-Za-z0-9_]*)", _code))
+_defined |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", _code))
+_defined |= set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:function|\()", _code))
+# Function parameters count as defined: a callback passed in and then invoked
+# is a call to a name that is never declared at top level.
+for _plist in re.findall(r"function\s*[A-Za-z0-9_]*\s*\(([^)]*)\)", _code):
+    _defined |= {q.strip().split("=")[0].strip() for q in _plist.split(",") if q.strip()}
+for _plist in re.findall(r"\(([^()]*)\)\s*=>", _code):
+    _defined |= {q.strip().split("=")[0].strip() for q in _plist.split(",") if q.strip()}
+_defined |= set(re.findall(r"(?<![.\w$])([A-Za-z_][A-Za-z0-9_]*)\s*=>", _code))
+_defined.discard("")
+_undef = sorted(n for n in _called - _defined - _BUILTIN if not n[0].isupper())
+chk("every called function is defined", not _undef, ", ".join(_undef[:10]))
+
 # controls the server accepts must all be wired
-for cid in ("channel", "nsamples", "speed", "nfft", "max_frames", "avg",
+# 'speed' is deliberately absent: Speed_Set must be 0 (spec 8.1), the server
+# rejects anything else, so there is no control to wire.
+for cid in ("channel", "nsamples", "nfft", "max_frames", "avg",
             "classify", "pfa_exp"):
     chk(f"control '{cid}' is in CTL_IDS or handled",
         f"'{cid}'" in js, "")

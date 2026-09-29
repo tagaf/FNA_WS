@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ad9643 as A
+import stream as ST
+import diag as DG
 import gpu
 import noise
 import phasenoise as PN
@@ -56,6 +58,25 @@ def log_display(shown, bin_hz, out_n):
     starts = np.floor(idx[:-1]).astype(np.int64)
     starts = np.maximum.accumulate(np.clip(starts, 1, nb - 2)) - 1  # into shown[1:]
     d = np.maximum.reduceat(shown[1:], starts).astype(np.float32)
+    return d, bin_hz, (nb - 1) * bin_hz
+
+
+def lin_display(shown, bin_hz, out_n):
+    """Max-pool the spectrum onto out_n points spaced uniformly in FREQUENCY,
+    from the first bin to Nyquist -- the linear counterpart to log_display().
+
+    Same max-pooling, so a narrow tone still survives the decimation; only the
+    spacing differs. The client maps display point k linearly onto its axis
+    either way, so the two only agree if the axis type matches the spacing --
+    which is why the choice is reported back in the frame metadata rather than
+    assumed."""
+    nb = len(shown)
+    if nb < 4:
+        d = shown[1:].astype(np.float32, copy=True)
+        return d, bin_hz, max(1, nb - 1) * bin_hz
+    body = shown[1:]
+    starts = np.linspace(0, len(body), out_n + 1).astype(np.int64)[:-1]
+    d = np.maximum.reduceat(body, starts).astype(np.float32)
     return d, bin_hz, (nb - 1) * bin_hz
 
 
@@ -256,6 +277,206 @@ class DmaReader:
         self._kill_helper()
 
 
+class DiagSession:
+    """Owns the board while the diagnostics tab is open.
+
+    Three things have to be true at once and none of them survive being left
+    to the client:
+
+    1. Acquisition is STOPPED. Diagnostics change ChannelSel, DataNum and the
+       ADC test pattern; a capture loop running underneath would fight them.
+    2. Only ONE test runs at a time, so two sweeps cannot both be driving
+       reg13.
+    3. The ADC is ALWAYS restored -- normal output plus the stored data delay
+       -- when a test ends, fails, is cancelled, or the client disappears.
+
+    (3) is why this is a LEASE rather than a flag. The transport is polling,
+    not a websocket, so there is no disconnect to catch: the client renews
+    every ~2 s and the watchdog releases the board if renewals stop. Closing
+    the tab, navigating away and pulling the network cable all look the same,
+    which is what we want.
+    """
+
+    # Browsers throttle setInterval in hidden/background tabs (often to once a
+    # minute), so a short lease WILL lapse while the tab is still open. That is
+    # fine -- the board is released and the ADC restored, which is the point --
+    # but the client must be able to take it straight back. keepalive()
+    # re-acquires rather than failing, so a lapse costs a stopped acquisition,
+    # not a stuck tab.
+    LEASE_S = 15.0         # tolerate a few missed 2 s keepalives
+    WATCH_S = 1.0
+
+    def __init__(self, engine):
+        self.e = engine
+        self.lock = threading.Lock()
+        self.owner = None              # opaque client token
+        self.expires = 0.0
+        self.prev_running = False
+        self.test = None               # name of the running test
+        self.frac = 0.0
+        self.msg = ""
+        self.points = []               # streamed progress points for live plots
+        self.result = None             # DiagResult
+        self.error = None
+        self._cancel = False
+        self._th = None
+        self._watch = threading.Thread(target=self._watchdog, daemon=True)
+        self._watch.start()
+
+    # ---------------------------------------------------------- lease
+    @property
+    def active(self):
+        return self.owner is not None and time.monotonic() < self.expires
+
+    def enter(self, token):
+        with self.lock:
+            if self.active and self.owner != token:
+                raise RuntimeError("diagnostics already in use by another client")
+            first = not self.active
+            self.owner = token
+            self.expires = time.monotonic() + self.LEASE_S
+            if first:
+                self.prev_running = self.e.running
+                self._stop_acquisition()
+        return self.state()
+
+    def keepalive(self, token):
+        with self.lock:
+            if self.owner == token:
+                self.expires = time.monotonic() + self.LEASE_S
+                return self.state()
+            if self.owner is not None and time.monotonic() < self.expires:
+                raise RuntimeError("another client holds the diagnostics board")
+            # Free, or our own lapsed lease: take it back. Re-entering redoes
+            # the stop-acquisition sequence, which is exactly what is needed
+            # after a lapse handed the board back to the capture loop.
+            first = not self.active
+            self.owner = token
+            self.expires = time.monotonic() + self.LEASE_S
+            if first:
+                self.prev_running = self.e.running
+                self._stop_acquisition()
+            return self.state()
+
+    def leave(self, token=None):
+        with self.lock:
+            if self.owner is None:
+                return self.state()
+            if token is not None and token != self.owner:
+                raise RuntimeError("not the diagnostics owner")
+            self._release()
+        return self.state()
+
+    def _release(self):
+        """Caller holds self.lock."""
+        self._cancel = True
+        th = self._th
+        if th is not None and th.is_alive():
+            th.join(timeout=15.0)
+        try:
+            if not self.e.mock:
+                DG.restore_adc(self.e.adc)
+        except Exception as ex:
+            self.error = f"restore failed: {type(ex).__name__}: {ex}"
+        self.owner = None
+        self.expires = 0.0
+        self.test = None
+        self.e.running = self.prev_running
+        self.e._dirty.set()
+
+    def _watchdog(self):
+        while True:
+            time.sleep(self.WATCH_S)
+            with self.lock:
+                if self.owner is not None and time.monotonic() >= self.expires:
+                    # client vanished: same path as an explicit leave
+                    self._release()
+
+    def _stop_acquisition(self):
+        """reg0 = 0 and wait for reg5 to settle, per interface section 6.5."""
+        self.e.running = False
+        time.sleep(0.3)
+        if self.e.mock:
+            return
+        try:
+            self.e._teardown_stream()
+            self.e.adc.wr(A.REG_START, 0)
+            last = -1
+            for _ in range(12):            # up to ~1.2 s; a lap is <= 65.5 ms
+                time.sleep(0.1)
+                now = self.e.adc.rd(A.REG_SEGCNT)
+                if now == last:
+                    break
+                last = now
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------- running tests
+    def start(self, token, name, params):
+        fn = DG.ALL_TESTS.get(name)
+        if fn is None:
+            raise ValueError(f"unknown test {name!r}")
+        with self.lock:
+            if self.owner != token:
+                raise RuntimeError(
+                    "diagnostics lease lapsed or held by another client"
+                    " -- re-enter the tab")
+            if self.test is not None:
+                raise RuntimeError(f"{self.test} is already running")
+            self.expires = time.monotonic() + self.LEASE_S
+            self.test, self.frac, self.msg = name, 0.0, "starting"
+            self.points, self.result, self.error = [], None, None
+            self._cancel = False
+
+        def progress(frac, msg, **extra):
+            self.frac, self.msg = frac, msg
+            p = extra.get("point")
+            if p is not None and len(self.points) < 4096:
+                self.points.append(p)
+
+        def cancelled():
+            return self._cancel
+
+        def work():
+            try:
+                r = fn(self.e.adc, progress=progress, cancel=cancelled, **params)
+                self.result = r
+            except DG.Cancelled:
+                self.error = "cancelled"
+            except Exception as ex:
+                self.error = f"{type(ex).__name__}: {ex}"
+            finally:
+                # Whatever happened, the converter goes back to normal output
+                # and the stored tap before anything else can use the board.
+                try:
+                    if not self.e.mock:
+                        DG.restore_adc(self.e.adc)
+                except Exception:
+                    pass
+                self.test = None
+                self.frac = 1.0
+                self.e._dirty.set()
+
+        self._th = threading.Thread(target=work, daemon=True)
+        self._th.start()
+        return self.state()
+
+    def cancel(self, token=None):
+        if token is not None and token != self.owner:
+            raise RuntimeError("not the diagnostics owner")
+        self._cancel = True
+        return self.state()
+
+    def state(self):
+        r = self.result
+        return {"active": self.active, "owner": bool(self.owner),
+                "test": self.test, "frac": self.frac, "msg": self.msg,
+                "error": self.error, "npoints": len(self.points),
+                "lease_s": max(0.0, self.expires - time.monotonic())
+                           if self.owner else 0.0,
+                "result": r.to_json() if r is not None else None}
+
+
 class MockAdc:
     """Synthetic stand-in with correct timing semantics (finish goes low on
     arm, comes back after N*(speed+1)/fs). NEVER opens /dev/*. For UI and
@@ -360,9 +581,9 @@ class MockInterferometer:
         self._phi0 = 0.0
         self._n = 0
 
-    def read_into(self, out, nsamples, addr=0):
-        # nsamples counts 16-bit WORDS in dual mode: two per sample clock
-        n = nsamples // 2
+    def _photocurrents(self, n):
+        """n samples of the interferometer's two photocurrents (ia, ib),
+        continuing the phase walk from the previous call."""
         k, a = self._k, self._a
         steps = self._rng.normal(0.0, np.sqrt(2 * np.pi * self.dnu /
                                               A.BASE_CLOCK_HZ), n)
@@ -379,9 +600,32 @@ class MockInterferometer:
         noise_b = self._rng.normal(0, 3.0, n)
         ia = -300.0 + 2600.0 * np.cos(dphi + drift) + noise_a
         ib = 450.0 + 2100.0 * np.cos(dphi + drift + self.psi) + noise_b
-        w = np.empty(2 * n, np.uint16)
-        w[0::2] = np.clip(np.round(ia), -8192, 8191).astype(np.int16).view(np.uint16) & 0x3FFF
-        w[1::2] = np.clip(np.round(ib), -8192, 8191).astype(np.int16).view(np.uint16) & 0x3FFF
+        return ia, ib
+
+    def read_into(self, out, nsamples, addr=0):
+        # `nsamples` means two different things depending on Channel_Set,
+        # exactly as it does for the real DMA path (see server.py's _one()):
+        # doubled 16-bit WORDS in dual mode, plain samples otherwise. This
+        # class used to assume dual mode unconditionally, so selecting
+        # Channel 1/2 alone (e.g. to look at one photodiode, or by an
+        # accidental UI click) silently fed single-channel code a still-
+        # interleaved A/B stream -- wrong data, and reported as "looks
+        # different" rather than as the bug it was.
+        ch = self._adc.rd(A.REG_CHANNEL) if self._adc is not None else A.CH_BOTH
+        if ch == A.CH_BOTH:
+            n = nsamples // 2
+            ia, ib = self._photocurrents(n)
+            w = np.empty(2 * n, np.uint16)
+            w[0::2] = np.clip(np.round(ia), -8192, 8191).astype(np.int16).view(np.uint16) & 0x3FFF
+            w[1::2] = np.clip(np.round(ib), -8192, 8191).astype(np.int16).view(np.uint16) & 0x3FFF
+        elif ch in (A.CH_A, A.CH_B):
+            ia, ib = self._photocurrents(nsamples)
+            sel = ia if ch == A.CH_A else ib
+            w = np.clip(np.round(sel), -8192, 8191).astype(np.int16).view(np.uint16) & 0x3FFF
+        else:  # CH_TEST_RAMP: a free-running counter, like the real FPGA's
+            base = self._n
+            self._n += nsamples
+            w = (np.arange(base, base + nsamples, dtype=np.uint32) & 0x3FFF).astype(np.uint16)
         m = min(out.size, w.size)
         out[:m] = w[:m]
         return m
@@ -394,6 +638,7 @@ class MockInterferometer:
 class Engine:
     def __init__(self, nsamples=1 << 20, channel=1, speed=0, nfft=8192,
                  max_frames=64, trace_width=1024, avg=4, min_period=0.005,
+                 tap=None,
                  fast_dma=False, mock=False, mock_opts=None):
         self.fast_dma = fast_dma
         self.mock = mock                  # False | True | "interferometer"
@@ -404,8 +649,53 @@ class Engine:
                                               # (explicit count still accepted)
                         classify=0,           # 1: run peak/noise classification
                         pfa_exp=6,            # detection sensitivity: Pfa=1e-N
-                        readback=-1)   # -1 auto, 0 full N, >0 explicit
+                        readback=-1,   # -1 auto, 0 full N, >0 explicit
+                        disp_log=1,    # spectrum x axis: 1 = log, 0 = linear
+                        # --- acquisition mode -------------------------------
+                        # 0 = block (legacy): arm, wait for Adc_Finish, DMA
+                        #     one record. The frame rate is whatever a whole
+                        #     capture+readback cycle costs, so it VARIES with
+                        #     record length (238 fps at 1 M samples, 1.5 at
+                        #     16 M).
+                        # 1 = stream: the FPGA fills the 16-segment DDR ring
+                        #     continuously and a reader thread drains it into
+                        #     a RAM ring. The display then samples the NEWEST
+                        #     segment at a fixed cadence, so the frame rate is
+                        #     constant and independent of record length -- what
+                        #     changes with load is how much data each frame
+                        #     skips over, not how often frames arrive.
+                        mode=0,
+                        fps=20,        # display cadence in stream mode; also a
+                                       # cap in block mode. 0 = as fast as able
+                        stream_ram_gb=4,
+                        stream_channels=2,
+                        # Optional bound on the samples the time-trace
+                        # envelope spans per frame in stream mode. 0 = off:
+                        # `nsamples` means what it says and the frame rate is
+                        # whatever that record length allows (still CONSTANT,
+                        # just lower). Set it >0 to trade record length for a
+                        # higher fixed rate. It defaulted to 2 M briefly and
+                        # that was wrong: silently showing 32 ms when 268 ms
+                        # was asked for is worse than an honest lower rate.
+                        stream_window=0,
+                        # 0 = time axis spans the RECORD (nsamples)
+                        # 1 = time axis spans the WHOLE RAM RING, drawn from
+                        #     per-segment summaries built as segments arrive.
+                        #     Lets the axis cover seconds without pulling
+                        #     gigabytes through the CPU every frame.
+                        trace_span_ring=0)
         self.trace_width = trace_width
+        self.tap = tap                    # IDELAY tap to apply at open
+        self._ramp_busy = False
+        self._ramp_result = None
+        self._ctr_result = None
+        self._eye_result = None
+        self.diag = None                  # DiagSession, created after startup
+        self.stream = None                # stream.Stream while mode=1
+        self._skey = None                 # (channel, ram_gb, nchan) in use
+        self.stream_seg = -1              # newest segment the display used
+        self.stream_span = (0, 0)         # (first, last) segments in the frame
+        self.stream_err = None
         self.min_period = min_period      # floor on loop period; leaves the
                                           # scheduler room for networking
         self.running = True
@@ -497,11 +787,15 @@ class Engine:
                         if self.mock == "interferometer"
                         else MockDma(self.adc))
         else:
-            self.adc = A.Adc()
+            # tap=None -> apply the stored IDELAY tap. The FPGA loses it on
+            # every reconfiguration, so the server is one of the places that
+            # has to re-apply it (see ad9643.load_stored_tap).
+            self.adc = A.Adc(tap=self.tap)
             self.dma = DmaReader(self.fast_dma)
         self.sp = gpu.Spectrum(self.cfg["nfft"],
                                max_samples=max(1 << 22, self.cfg["nsamples"]),
                                trace_width=self.trace_width)
+        self.diag = DiagSession(self)
         self.th = threading.Thread(target=self._loop, daemon=True)
         self.th.start()
         self.an_th = threading.Thread(target=self._analysis_loop, daemon=True)
@@ -513,6 +807,14 @@ class Engine:
 
     def stop(self):
         self._stop.set()
+        if self.diag is not None:
+            try:
+                self.diag.leave()
+            except Exception:
+                pass
+        # The FPGA ring keeps writing until reg0 is cleared, and the helper
+        # subprocesses outlive this process unless they are told to quit.
+        self._teardown_stream()
         # One in-flight cycle at max samples/FFT takes ~2.3s (1.05s capture +
         # ~1s DMA + ~0.3s GPU); 3s left too little margin -- a single Ctrl-C
         # could still be waiting on join() when the terminal least expects it,
@@ -530,6 +832,14 @@ class Engine:
         self.sp.close(); self.dma.close(); self.adc.close()
 
     def configure(self, **kw):
+        # While the diagnostics tab holds the board, acquisition settings are
+        # read-only: a capture starting underneath a tap sweep or a test
+        # pattern change would produce data that matches neither.
+        if self.diag is not None and self.diag.active:
+            if kw.get("running") or kw.get("trigger"):
+                raise RuntimeError(
+                    "diagnostics active: acquisition is locked. Leave the "
+                    "ADC/FPGA tab to release it.")
         trig = bool(kw.pop("trigger", False))
         UNSET = object()
         zoom = kw.pop("zoom", UNSET)
@@ -537,6 +847,13 @@ class Engine:
             for k, v in kw.items():
                 if k == "running":
                     self.running = bool(v)
+                elif k == "speed":
+                    if int(v) != 0:
+                        raise ValueError(
+                            "Speed_Set must be 0: it does not decimate (fs is "
+                            "always 250 Msps) and a non-zero value corrupts "
+                            "block lengths on this bitstream (spec 8.1)")
+                    self.cfg[k] = 0
                 elif k in self.cfg:
                     self.cfg[k] = int(v)
             self._acc = None; self._acc_n = 0
@@ -672,8 +989,8 @@ class Engine:
                 # ~16383, the Lissajous shatters into fragments, and the fit
                 # comes back with amplitudes of 10000 codes on a 2600-code
                 # fringe -- confidently, since fragments still admit a conic.
-                xa = A.to_signed(xa).astype(np.int16)
-                xb = A.to_signed(xb).astype(np.int16)
+                xa = A.adc_signed(xa).astype(np.int16)
+                xb = A.adc_signed(xb).astype(np.int16)
                 self._pn_push_cal(xa, xb)
                 cal = self._pn_calibration(cfg)
                 r = PN.analyse(
@@ -729,9 +1046,475 @@ class Engine:
             self._dual_stage = np.empty(nwords, np.uint16)
         return self._dual_stage
 
+    # ------------------------------------------------------ hardware report
+    # reg -> (name, decoder). The decoders exist so the tab shows what a bit
+    # MEANS, not just its value: a raw 0x00000005 in reg10 is the difference
+    # between a healthy front end and a dead one, and nobody should have to
+    # remember which bit is which to see that.
+    REG_INFO = [
+        (A.REG_START,     "reg0  start/stream",
+         lambda v: ("stopped" if not (v & 3) else
+                    ("streaming" if v & 2 else "block") +
+                    (", started" if v & 1 else ", idle"))),
+        (A.REG_SPEED,     "reg1  Speed_Set",
+         lambda v: "0 (required)" if v == 0 else f"{v} -- MUST BE 0"),
+        (A.REG_CHANNEL,   "reg2  ChannelSel",
+         lambda v: {0: "0 = FPGA counter", 1: "1 = ADC A", 2: "2 = ADC B",
+                    3: "3 = A+B"}.get(v & 3, str(v))),
+        (A.REG_NSAMPLES,  "reg3  DataNum",     lambda v: f"{v:,} sample clocks"),
+        (A.REG_FINISH,    "reg4  Adc_Finish",
+         lambda v: "complete" if v & 1 else "busy"),
+        (A.REG_SEGCNT,    "reg5  seg_count",   lambda v: f"{v:,} segments"),
+        (A.REG_FLAGS,     "reg6  stream flags",
+         lambda v: (", ".join(x for x, c in
+                              (("overrun", v & 1), ("fifo_overflow", v & 2)) if c)
+                    or "clear")),
+        (A.REG_SEGACK,    "reg7  host_seg_ack", lambda v: f"{v:,}"),
+        (A.REG_SPI_CMD,   "reg8  SPI command",
+         lambda v: f"{'read' if v >> 31 else 'write'} "
+                   f"addr 0x{(v >> 8) & 0x1FFF:02X} data 0x{v & 0xFF:02X}"),
+        (A.REG_SPI_STATUS, "reg9  SPI status",
+         lambda v: ("busy" if v & 1 else "idle") + f", last read 0x{(v >> 8) & 0xFF:02X}"),
+        (A.REG_ADC_STATUS, "reg10 ADC status",
+         lambda v: ", ".join(
+             [("clk locked" if v & 1 else "CLK NOT LOCKED"),
+              ("IDELAY ready" if v & 8 else "IDELAYCTRL NOT READY")]
+             + (["overrange A"] if v & 2 else []) + (["overrange B"] if v & 4 else []))),
+        (A.REG_RAMP_ERR_A, "reg11 ramp errors A",
+         lambda v: "saturated" if v == 0xFFFFFFFF else f"{v:,}"),
+        (A.REG_RAMP_ERR_B, "reg12 ramp errors B",
+         lambda v: "saturated" if v == 0xFFFFFFFF else f"{v:,}"),
+        (A.REG_DELAY,      "reg13 data delay",
+         lambda v: f"requested {v & 0x1FF}, read back {(v >> 16) & 0x1FF}"),
+        (A.REG_RSVD14,     "reg14 reserved",    lambda v: "0" if v == 0 else f"0x{v:08X}"),
+        (A.REG_DESIGN_ID,  "reg15 design ID",
+         lambda v: ("0x%08X" % v) + (" (match)" if v == A.DESIGN_ID
+                                     else f" -- expected 0x{A.DESIGN_ID:08X}")),
+    ]
+
+    _LINK = "/sys/bus/pci/devices/0005:01:00.0"
+
+    def hw_link(self):
+        """PCIe link state from sysfs. Cheap, and it is the first thing that
+        goes wrong after an FPGA reconfiguration: the BARs get wiped and every
+        register reads 0xFFFFFFFF."""
+        out = {}
+        for k, f in (("speed", "current_link_speed"), ("width", "current_link_width"),
+                     ("max_speed", "max_link_speed"), ("max_width", "max_link_width"),
+                     ("enabled", "enable")):
+            try:
+                out[k] = open(os.path.join(self._LINK, f)).read().strip()
+            except OSError:
+                out[k] = None
+        try:
+            out["driver"] = os.path.basename(
+                os.readlink(os.path.join(self._LINK, "driver")))
+        except OSError:
+            out["driver"] = None
+        return out
+
+    def hw_snapshot(self, dump=False):
+        if self.mock:
+            return {"mock": True, "regs": [], "adc": self.adc_health(),
+                    "link": {}, "dma_path": "mock"}
+        regs = []
+        for off, name, dec in self.REG_INFO:
+            v = self.adc.rd(off)
+            try:
+                d = dec(v)
+            except Exception:
+                d = ""
+            regs.append({"offset": off, "name": name, "value": int(v), "decode": d})
+        out = {"mock": False, "regs": regs, "adc": self.adc_health(),
+               "link": self.hw_link(),
+               "dma_path": getattr(self.dma, "path", "?"),
+               "seg_bytes": A.SEG_BYTES, "nseg": A.NSEG,
+               "alias_bytes": A.REG_ALIAS_BYTES,
+               "counter_test": self._ctr_result,
+               "eye_scan": self._eye_result}
+        if dump:
+            try:
+                out["adc_registers"] = self.adc_dump()
+            except Exception as e:
+                out["adc_dump_error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    # ------------------------------------------------------- hardware tests
+    def _pause_for(self, fn, slot):
+        """Run `fn` with acquisition stopped, restoring it afterwards."""
+        def work():
+            was = self.running
+            try:
+                self.running = False
+                time.sleep(0.3)
+                with self.lock:
+                    r = fn()
+                r["ts"] = time.time(); r["running"] = False
+                setattr(self, slot, r)
+            except Exception as e:
+                setattr(self, slot, {"running": False, "ts": time.time(),
+                                     "error": f"{type(e).__name__}: {e}"})
+            finally:
+                self.running = was
+                self._dirty.set()
+        setattr(self, slot, {"running": True})
+        threading.Thread(target=work, daemon=True).start()
+        return {"started": True}
+
+    def counter_test(self, nsamples=1048576):
+        """Spec 7.1 from the UI: the FPGA counter must be a clean ramp. This
+        exercises FIFO, DDR writer, XDMA and the host decode WITHOUT the ADC,
+        so it separates 'the board is broken' from 'the ADC path is broken'."""
+        if self.mock:
+            raise RuntimeError("no hardware in mock mode")
+        n = int(nsamples)
+        if not (256 <= n <= (1 << 24)) or n % 256:
+            raise ValueError("nsamples must be a multiple of 256, 256..16777216")
+
+        def run():
+            d = self.adc.capture(n, channel=A.CH_TEST_RAMP)
+            a = (d & 0x3FFF).astype(np.uint16)
+            diff = np.empty(a.size - 1, np.uint16)
+            np.subtract(a[1:], a[:-1], out=diff)
+            np.bitwise_and(diff, 0x3FFF, out=diff)
+            bad = int(np.count_nonzero(diff != 1))
+            return {"samples": int(a.size), "violations": bad,
+                    "high_bits": bool((d & 0xC000).any()),
+                    "first": a[:8].tolist(), "pass": bad == 0}
+        return self._pause_for(run, "_ctr_result")
+
+    def eye_scan(self, step=8, dwell=0.01, nsamp=65536):
+        """Spec 9.4 sweep, run in the background with the ADC on its ramp."""
+        if self.mock:
+            raise RuntimeError("no hardware in mock mode")
+        self.adc.require_design_id("the eye scan")
+        step = max(1, min(64, int(step)))
+        nsamp = max(4096, min(1 << 20, int(nsamp)))
+        nsamp -= nsamp % A.SAMPLE_GRANULARITY_DUAL
+
+        def run():
+            tap0 = self.adc.get_tap()["requested"]
+            rows = []
+            try:
+                with self.adc.ramp_mode():
+                    for tap in range(0, A.DELAY_TAPS, step):
+                        self.adc.wr(A.REG_DELAY, tap)
+                        time.sleep(50e-6)
+                        # reg11/reg12 since the 2026-09-29 bitstream: no
+                        # capture per tap, so the sweep is faster and the FPGA
+                        # sees every sample rather than a block. The host
+                        # method is still reachable from the diagnostics tab
+                        # for comparison.
+                        self.adc.ramp_clear()
+                        time.sleep(dwell)
+                        ea, eb = self.adc.ramp_errors()
+                        rows.append([tap, int(ea), int(eb)])
+            finally:
+                self.adc.wr(A.REG_DELAY, tap0)
+            best = cur = None
+            for tap, ea, eb in rows:
+                if ea == 0 and eb == 0:
+                    cur = (tap, tap) if cur is None else (cur[0], tap)
+                    if best is None or (cur[1] - cur[0]) > (best[1] - best[0]):
+                        best = cur
+                else:
+                    cur = None
+            res = {"step": step, "samples": nsamp, "rows": rows, "tap0": tap0,
+                   "ps_per_tap": A.PS_PER_TAP, "ui_taps": A.UI_TAPS}
+            if best:
+                res.update({"found": True, "lo": best[0], "hi": best[1],
+                            "width": best[1] - best[0] + step,
+                            "centre": (best[0] + best[1]) // 2,
+                            "ps": (best[1] - best[0] + step) * A.PS_PER_TAP,
+                            "edge": best[0] <= 0 or best[1] >= A.DELAY_TAPS - step})
+            else:
+                res["found"] = False
+            return res
+        return self._pause_for(run, "_eye_result")
+
+    # ----------------------------------------------------------- ADC health
+    def adc_health(self):
+        """Cheap per-frame ADC/front-end health (design ID 0xAD964302).
+
+        Three MMIO reads. Worth doing every frame because these are exactly
+        the bits that say "the numbers on screen are meaningless": on
+        2026-09-29 the ADC LVDS capture was dead (every sample constant) with
+        reg10 bit3 IDELAYCTRL-ready low, and nothing in the UI said so -- the
+        spectrum just looked like a very quiet input.
+        """
+        if self.mock:
+            return {"present": False, "reason": "mock"}
+        try:
+            if not self.adc.has_adc_ctl:
+                return {"present": False,
+                        "design_id": self.adc.design_id,
+                        "reason": f"design ID 0x{self.adc.design_id:08X} "
+                                  f"(needs 0x{A.DESIGN_ID:08X})"}
+            st = self.adc.adc_status()
+            tp = self.adc.get_tap()
+            return {"present": True,
+                    "design_id": self.adc.design_id,
+                    "clk_locked": st["clk_locked"],
+                    "overrange_a": st["overrange_a"],
+                    "overrange_b": st["overrange_b"],
+                    "idelay_ready": st["idelay_ready"],
+                    "tap_requested": tp["requested"],
+                    "tap_readback": tp["readback"],
+                    "applied_tap": self.adc.applied_tap,
+                    "output_mode": self.adc.output_mode,
+                    "output_invert": self.adc.output_invert,
+                    "ramp_test": self._ramp_result}
+        except Exception as e:
+            return {"present": False, "reason": f"{type(e).__name__}: {e}"}
+
+    def adc_dump(self, lo=0x00, hi=0x3A):
+        """Full ADC register dump. On demand only: ~3.3 us per SPI transfer."""
+        if self.mock:
+            raise RuntimeError("no ADC in mock mode")
+        self.adc.require_design_id("the ADC register dump")
+        with self.lock:
+            return {f"0x{a:02X}": self.adc.adc_rd(a) for a in range(lo, hi + 1)}
+
+    def adc_set_tap(self, tap, save=False):
+        if self.mock:
+            raise RuntimeError("no ADC in mock mode")
+        self.adc.require_design_id("the ADC data delay")
+        with self.lock:
+            r = self.adc.set_tap(int(tap))
+        if save:
+            A.save_stored_tap(int(tap))
+        return r
+
+    def adc_clear_flags(self):
+        if self.mock:
+            raise RuntimeError("no ADC in mock mode")
+        self.adc.require_design_id("the ADC status flags")
+        self.adc.ramp_clear()
+        return self.adc.adc_status()
+
+    def ramp_test(self, seconds=5.0):
+        """Run a ramp check in the background, pausing acquisition.
+
+        The ADC has to emit its ramp for this, so any capture running at the
+        same time would be recording a sawtooth. Acquisition is therefore
+        stopped for the duration and restored afterwards -- including if the
+        test raises.
+        """
+        if self.mock:
+            raise RuntimeError("no ADC in mock mode")
+        self.adc.require_design_id("the ramp checker")
+        if self._ramp_busy:
+            raise RuntimeError("a ramp test is already running")
+
+        def work():
+            was_running = self.running
+            self._ramp_busy = True
+            self._ramp_result = {"running": True, "seconds": seconds}
+            try:
+                self.running = False
+                time.sleep(0.3)                 # let the loop finish a frame
+                with self.lock:
+                    with self.adc.ramp_mode():
+                        # reg11/reg12 ARE the verdict as of the 2026-09-29
+                        # bitstream: the checker now tests the second
+                        # difference, which this converter's ramp satisfies.
+                        # The host-side count is kept alongside as a cross
+                        # check -- when the two disagreed before, only the
+                        # host one was right, and knowing that immediately is
+                        # worth one extra pass over data already in RAM.
+                        self.adc.ramp_clear()
+                        t0 = time.monotonic()
+                        a = b = 0
+                        n = 0
+                        while time.monotonic() - t0 < seconds:
+                            d = self.adc.capture(1 << 18, channel=A.CH_BOTH)
+                            a += A.ramp_deviations(d[0::2])["errors"]
+                            b += A.ramp_deviations(d[1::2])["errors"]
+                            n += (1 << 18)
+                        fa, fb = self.adc.ramp_errors()
+                        st = self.adc.adc_status()
+                self._ramp_result = {
+                    "running": False, "seconds": seconds,
+                    "errors_a": int(fa), "errors_b": int(fb),
+                    "host_errors_a": int(a), "host_errors_b": int(b),
+                    "samples": n,
+                    "pass": (fa == 0 and fb == 0),
+                    "agree": (fa == 0) == (a == 0) and (fb == 0) == (b == 0),
+                    "status": st, "ts": time.time()}
+            except Exception as e:
+                self._ramp_result = {"running": False,
+                                     "error": f"{type(e).__name__}: {e}",
+                                     "ts": time.time()}
+            finally:
+                self._ramp_busy = False
+                self.running = was_running
+                self._dirty.set()
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"started": True, "seconds": seconds}
+
+    # ------------------------------------------------------------ streaming
+    def _stream_key(self, cfg):
+        return (cfg["channel"], float(cfg["stream_ram_gb"]),
+                int(cfg["stream_channels"]))
+
+    # ---------------------------------------------------- block acquisition
+    def _arm_block(self, cfg, N, ch):
+        """Legacy one-shot arm sequence (spec section 5)."""
+        self.adc.wr(A.REG_START, 0)          # stopped + block mode (bit1 low)
+        self.adc.wr(A.REG_SPEED, 0)          # spec 8.1: must be 0
+        self.adc.wr(A.REG_CHANNEL, ch)       # spec 8.2: only while stopped
+        # DataNum counts sample CLOCKS in every mode -- measured 2026-09-28,
+        # see ad9643.DUAL_DATANUM_IN_WORDS. The old `N * 2` here made every
+        # dual capture run twice as long as asked and, past 65,536,000 pairs,
+        # wrap the 500 MB window onto its own record: the phase-noise size of
+        # 67,108,864 pairs overran by 12,582,912 B, so the record read back
+        # from address 0 was spliced 3,145,728 pairs in.
+        self.adc.wr(A.REG_NSAMPLES, A.datanum_for(N, ch))
+        self.adc.wr(A.REG_START, A.START_BIT)
+        # reg4 idles HIGH and keeps the previous capture's state for well
+        # under a microsecond after the start edge, so polling immediately
+        # reads a stale "finished" (spec section 5).
+        time.sleep(10e-6)
+
+    def _wait_block(self, ch, N, expect):
+        """Poll Adc_Finish. Returns (elapsed, suspect).
+
+        Adc_Finish NOW ASSERTS IN DUAL MODE. On the previous bitstream it
+        never did at any depth (NOTES.md #30) and this blind-waited expect*4
+        for ch_sel=3 -- four times longer than the capture, which is why
+        dual-channel frame rates were a third of single-channel. Verified on
+        the 2026-09-28 streaming build: ch_sel=3 at 1,048,576 and 67,108,864
+        samples both asserted, elapsed/expected = 1.000.
+        """
+        timeout = max(0.5, expect * 4 + 0.5)
+        t0 = time.monotonic()
+        while not self.adc.finished:
+            if time.monotonic() - t0 > timeout:
+                st = self.adc.regs(); self.adc.recover()
+                raise A.CaptureTimeout(
+                    f"Adc_Finish low after {timeout:.3f}s regs={st}")
+            time.sleep(1e-4)      # never busy-spin on MMIO reads
+        t_cap = time.monotonic() - t0
+        if ch == A.CH_BOTH:
+            # Adc_Finish can lead the last few bursts (<= 8 x 512 B) into DDR
+            # by a few microseconds (spec section 5, known FPGA issue).
+            time.sleep(20e-6)
+        # Physics check: the FSM cannot digitise N samples faster than N/fs,
+        # so a completion far short of that means Adc_Finish was still high
+        # from the previous run and we are about to read a buffer that was
+        # never filled. Flag it rather than publishing a plausible-looking
+        # spectrum built from stale DDR.
+        return t_cap, t_cap < 0.5 * expect
+
+    def _stream_meta(self, streaming):
+        """Per-frame stream telemetry. `mode` is what the UI switches on; the
+        rest is what tells the operator whether the display is keeping up --
+        `lost` and the reg6 flags are the ones that matter, because in stream
+        mode a display that falls behind shows OLDER data rather than fewer
+        frames, which is otherwise invisible."""
+        st = self.stream
+        if not streaming or st is None:
+            return {"mode": "block", "err": self.stream_err}
+        ring = st.ring
+        per_sample = 4 if st.channel == A.CH_BOTH else 2
+        seg_s = A.SEG_BYTES / (A.BASE_CLOCK_HZ * per_sample)
+        lo, hi = (ring.resident if ring else (0, 0))
+        return {
+            "mode": "stream",
+            "err": self.stream_err,
+            "segments": st.n_read,
+            "lost": st.n_lost,
+            "first_overrun_at": st.first_overrun_at,
+            "flags": int(st.flags_seen),
+            "overrun": bool(st.flags_seen & A.FLAG_OVERRUN),
+            "fifo_overflow": bool(st.flags_seen & A.FLAG_FIFO_OVF),
+            "gb_read": st.bytes_read / 1e9,
+            "rate_gbps": (st.bytes_read / (time.monotonic() - st.t_start) / 1e9)
+                         if st.t_start else 0.0,
+            "needed_gbps": A.SEG_BYTES / seg_s / 1e9,
+            "seg_period_ms": seg_s * 1e3,
+            "ring_segments": ring.nslots if ring else 0,
+            "ring_gb": (ring.nslots * A.SEG_BYTES / 1e9) if ring else 0.0,
+            "ring_seconds": (ring.nslots * seg_s) if ring else 0.0,
+            "resident": [lo, hi],
+            "evicted": ring.evicted if ring else 0,
+            "shown_segment": self.stream_seg,
+            "shown_span": list(self.stream_span),
+            "shown_segments": max(0, self.stream_span[1] - self.stream_span[0] + 1),
+            "age_ms": ((hi - self.stream_seg) * seg_s * 1e3)
+                      if self.stream_seg >= 0 else 0.0,
+            "frames_late": getattr(self, "frames_late", 0),
+        }
+
+    def _maybe_leave_stream(self, cfg):
+        """Block capture and streaming cannot share the FPGA: stream mode
+        leaves reg0 bit1 set and the writer free-running, and arming a block
+        capture on top of that would race the ring writer."""
+        if not cfg.get("mode", 0) and self.stream is not None:
+            self._teardown_stream()
+
+    def _ensure_stream(self, cfg):
+        """Bring the background stream up, or reconfigure it if the channel /
+        ring size / C2H fan-out changed. ChannelSel may only be written while
+        stopped (spec 8.2), so a channel change is a full restart."""
+        key = self._stream_key(cfg)
+        if self.stream is not None and self.stream.alive and self._skey == key:
+            return self.stream
+        self._teardown_stream()
+        nslots = max(3, int(cfg["stream_ram_gb"] * 1000**3) // A.SEG_BYTES)
+        st = ST.Stream(self.adc, cfg["channel"], nchan=int(cfg["stream_channels"]),
+                       nslots=nslots, ram_ring=True, envelope=True)
+        st.start_background()
+        self.stream, self._skey, self.stream_err = st, key, None
+        return st
+
+    def _teardown_stream(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop_background()
+            except Exception as e:
+                self.stream_err = f"{type(e).__name__}: {e}"
+            finally:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+        self.stream, self._skey = None, None
+
+    def _acquire_stream(self, cfg, ch, want_samples):
+        """Fill the staging buffers from the newest resident segment.
+
+        Returns (raw_src, n_samples) with exactly the layout the block path
+        produces, so everything downstream -- de-interleave, GPU, /raw, phase
+        noise -- is untouched.
+        """
+        st = self._ensure_stream(cfg)
+        seg = st.newest()
+        if seg is None:
+            return None, 0
+        self.stream_seg = seg
+        # A record may span SEVERAL consecutive ring segments. Capping it at
+        # one segment silently limited every record to 32.768 ms (mode 3) or
+        # 65.5 ms (single channel) however large `nsamples` was.
+        per_seg = A.seg_samples(ch)
+        usable = max(1, st.ring.n_resident - 4)   # keep clear of eviction
+        n = min(int(want_samples), per_seg * usable)
+        if ch == A.CH_BOTH:
+            nw = n * 2                            # two uint16 per sample clock
+            buf = self._dual_words(nw)
+            got, first = st.ring.read_span(seg, nw, buf[:nw])
+            self.stream_span = (first, seg)
+            return buf[:got.size], got.size // 2
+        got, first = st.ring.read_span(seg, n, self.sp.stage[:n])
+        self.stream_span = (first, seg)
+        return self.sp.stage[:got.size], got.size
+
     # ---- the loop
     def _loop(self):
         while not self._stop.is_set():
+            if self.diag is not None and self.diag.active:
+                time.sleep(0.05); continue
             if self.running:
                 pass
             elif self._single.is_set():
@@ -756,9 +1539,35 @@ class Engine:
                 self.err = f"{type(e).__name__}: {e}"
                 time.sleep(0.3)
             if self.running:               # no artificial delay after a single shot
-                slack = self.min_period - (time.monotonic() - t0)
+                # CONSTANT FRAME RATE.
+                # Block mode is capture-bound: a frame costs a whole
+                # arm+wait+DMA cycle, so the rate falls with record length
+                # (238 fps at 1 M samples, 1.5 fps at 16 M) and `fps` can only
+                # act as a ceiling.
+                # Stream mode is not: the FPGA fills the ring continuously and
+                # a frame only COPIES the newest segment, so the display can
+                # hold a fixed period regardless of record length. Pacing off
+                # an absolute schedule rather than sleeping a fixed slack
+                # keeps it from drifting when one frame runs long -- the next
+                # frame simply takes newer data, which is the whole point:
+                # what varies under load is how much data each frame skips,
+                # not how often frames arrive.
+                fps = int(cfg.get("fps", 0) or 0)
+                period = (1.0 / fps) if fps > 0 else self.min_period
+                period = max(period, self.min_period)
+                nxt = getattr(self, "_next_frame_at", 0.0)
+                now = time.monotonic()
+                if nxt <= 0.0 or now - nxt > 1.0:
+                    nxt = now              # first frame, or we fell far behind
+                nxt += period
+                self._next_frame_at = nxt
+                slack = nxt - time.monotonic()
                 if slack > 0:
                     time.sleep(slack)
+                else:
+                    self.frames_late = getattr(self, "frames_late", 0) + 1
+            else:
+                self._next_frame_at = 0.0
 
     # The structure (which frequencies belong to which family) is fetched
     # separately via /noise and only when it changes, so these can be
@@ -922,6 +1731,20 @@ class Engine:
         t_loop0 = time.monotonic()
         N, ch, sp_, nfft = cfg["nsamples"], cfg["channel"], cfg["speed"], cfg["nfft"]
 
+        # nfft > N cannot fill even one FFT frame: adc_process returns -1 and
+        # the capture raises, EVERY iteration, so the engine stops producing
+        # frames entirely and every connected client sits on its last good
+        # one looking frozen. Clamp instead of failing, because this state is
+        # reachable innocently: a client that changes record length and FFT
+        # length in two separate /control requests (which web/index.html
+        # does) is briefly in exactly this configuration, and a capture
+        # landing in that window should degrade, not wedge the engine until
+        # someone notices and sets a valid pair by hand.
+        if nfft > N:
+            nfft = max(1 << 10, 1 << int(N).bit_length() - 1)
+            nfft = min(nfft, N)
+            cfg["nfft"] = nfft
+
         # rebuild the GPU context if FFT size or capacity changed
         if nfft != self.sp.nfft or N > self.sp.max_samples:
             self.sp.close()
@@ -929,48 +1752,23 @@ class Engine:
                                    trace_width=self.trace_width)
             self._acc = None; self._acc_n = 0
 
-        A.Adc._validate(N, ch, sp_)
+        A.Adc._validate(N, ch, sp_,
+                        streaming=bool(cfg.get("mode", 0)) and not self.mock)
 
-        # arm clears Adc_Finish (it otherwise idles high from the previous run)
-        self.adc.wr(A.REG_SPEED, sp_)
-        self.adc.wr(A.REG_CHANNEL, ch)
-        # In A+B mode every sample clock emits TWO 16-bit words, and the
-        # FPGA's DDR accounting (burst_num = wr_ddr_num/256) is in 16-bit
-        # words -- so the count written must be doubled. The vendor client
-        # does exactly this: fpgaDataNum = depth*2 when ch==3.
-        self.adc.wr(A.REG_NSAMPLES, N * 2 if ch == A.CH_BOTH else N)
-        # duration DOES scale with the divider (the FSM counts decimated
-        # samples before releasing), even though the DATA is always full rate
-        expect = N * (sp_ + 1) / A.BASE_CLOCK_HZ
-        timeout = max(0.5, expect * 4 + 0.5)
-        t0 = time.monotonic()
-        self.adc.wr(A.REG_START, 0)
-        self.adc.wr(A.REG_START, 1)
-        if ch == A.CH_BOTH:
-            # Adc_Finish NEVER asserts in dual-channel mode -- verified at
-            # every depth from 4096 to 262144 -- yet the capture itself is
-            # fine: blind-waiting yields data that matches single-channel
-            # captures of the same inputs and differs run to run. The vendor
-            # client works around it the same way (it skips the poll in this
-            # mode and sleeps instead). See NOTES.md #30.
-            time.sleep(max(0.02, expect * 4 + 0.02))
-            t_cap = time.monotonic() - t0
-            suspect = False
+        # STREAM MODE: the FPGA ring is already free-running, so there is
+        # nothing to arm and no Adc_Finish to wait for -- the whole arm/poll
+        # block below is skipped and the samples come from the RAM ring
+        # instead of a fresh DMA. Everything after acquisition (GPU, traces,
+        # phase noise, frame build) is shared, deliberately: the two modes
+        # must not be able to drift apart in how they present data.
+        streaming = bool(cfg.get("mode", 0)) and not self.mock
+        self._maybe_leave_stream(cfg)
+        if streaming:
+            t_cap, suspect, expect = 0.0, False, N / A.BASE_CLOCK_HZ
         else:
-            while not self.adc.finished:
-                if time.monotonic() - t0 > timeout:
-                    st = self.adc.regs(); self.adc.recover()
-                    raise A.CaptureTimeout(f"Adc_Finish low after {timeout:.3f}s regs={st}")
-                time.sleep(1e-4)      # never busy-spin on MMIO reads
-            t_cap = time.monotonic() - t0
-
-        # Physics check. The FSM cannot digitise N samples faster than N/fs,
-        # so a completion far short of that means Adc_Finish was still high
-        # from the previous run (it idles high — see NOTES.md) and we are
-        # about to read a buffer that was never filled. Flag it rather than
-        # publishing a plausible-looking spectrum built from stale DDR.
-        if ch != A.CH_BOTH:
-            suspect = t_cap < 0.5 * expect
+            self._arm_block(cfg, N, ch)
+            expect = N / A.BASE_CLOCK_HZ
+            t_cap, suspect = self._wait_block(ch, N, expect)
 
         # Read back only what is actually consumed. The spectrum uses exactly
         # max_frames*nfft samples and the trace is decimated to trace_width
@@ -985,6 +1783,18 @@ class Engine:
         need = min(cfg["max_frames"], max(1, N // nfft)) * nfft
         tr_req = cfg.get("trace_samples", -1)
         trace_n = N if tr_req < 0 else min(max(256, tr_req), N)
+        if streaming and tr_req < 0 and int(cfg.get("stream_window", 0)) > 0:
+            # CONSTANT FRAME RATE depends on the per-frame work being bounded.
+            # "trace = the whole record" is the right default in block mode,
+            # where a frame IS one record. In stream mode the record is
+            # whatever `nsamples` says while the data arrives continuously, so
+            # letting the envelope span it makes the frame cost scale with
+            # `nsamples` again -- exactly the variable rate streaming is meant
+            # to remove. The FFT only ever consumes max_frames*nfft samples
+            # (524,288 by default) no matter how large `nsamples` is, so the
+            # envelope is the only thing pulling the whole record through the
+            # CPU. Bound it, and let stream_window raise it deliberately.
+            trace_n = min(trace_n, max(need, int(cfg["stream_window"])))
         rb = cfg.get("readback", -1)
         want = max(need, trace_n, rb) if rb > 0 else (N if rb == 0
                                                       else max(need, trace_n))
@@ -1007,18 +1817,38 @@ class Engine:
             # every sample clock emits BOTH channels as one 32-bit word, so
             # the record is twice as many uint16 words
             nbytes = read_n * 4
-            buf = self._dual_words(read_n * 2)
-            n = self.dma.read_into(buf, read_n * 2)
-            raw = buf[:n]
-            # vendor client: raw[2i] is channel A, raw[2i+1] is channel B
-            chans = {"A": raw[0::2], "B": raw[1::2]}
-            self.dual = {k: {"mean": float(A.to_signed(v).mean()),
-                             "std": float(A.to_signed(v).std()),
-                             "min": int(A.to_signed(v).min()),
-                             "max": int(A.to_signed(v).max())}
-                         for k, v in chans.items() if v.size}
-            # keep both, de-interleaved, so both can be analysed and drawn
-            self._pending = {k: np.array(v, copy=True) for k, v in chans.items()}
+            if streaming:
+                # Already in RAM: the stream reader DMA'd this segment while
+                # the previous frame was being drawn, so there is no transfer
+                # on the display path at all -- which is exactly why the frame
+                # rate stops depending on the record length.
+                raw, read_n = self._acquire_stream(cfg, ch, read_n)
+                if raw is None:
+                    return                    # ring not primed yet
+                nbytes = read_n * 4
+            else:
+                buf = self._dual_words(read_n * 2)
+                n = self.dma.read_into(buf, read_n * 2)
+                raw = buf[:n]
+            # vendor client: raw[2i] is channel A, raw[2i+1] is channel B.
+            # De-interleave into CONTIGUOUS arrays first, then sign-extend
+            # ONCE per channel and take all four statistics off that one
+            # array. This used to call to_signed() four times per channel on
+            # the STRIDED view, each promoting to int32 -- eight conversions
+            # and ~262 MB of allocation per frame at 8.192 M samples, which
+            # was 175 ms of the ~190 ms frame time and was being reported as
+            # "DMA". Both modes pay this path, so block mode got faster too.
+            self._pending = {"A": np.ascontiguousarray(raw[0::2]),
+                             "B": np.ascontiguousarray(raw[1::2])}
+            # self.dual is filled from the GPU further down. It used to be
+            # computed here with four numpy passes per channel -- mean, std,
+            # min and max each traversing the whole record. At the maximum
+            # record that was 2478 ms of a 3499 ms frame, 71% of the time, for
+            # four numbers in a readout. k_stats already computes exactly
+            # those on the device, in one pass, as part of work the frame does
+            # anyway, so the CPU passes were pure duplication.
+            self.dual = None
+            raw_src = raw
             if self.pn_cfg["enabled"] and self._pending["A"].size:
                 self._pn_submit(self._pending, A.sample_rate(sp_),
                                 dict(self.pn_cfg))
@@ -1027,17 +1857,42 @@ class Engine:
         else:
             self.dual = None
             self._pending = None
+            if streaming:
+                src, read_n = self._acquire_stream(cfg, ch, read_n)
+                if src is None:
+                    return                    # ring not primed yet
+                n = read_n
+            else:
+                n = self.dma.read_into(self.sp.stage, read_n)
             nbytes = read_n * 2
-            n = self.dma.read_into(self.sp.stage, read_n)
             self.sp.load(n * 2)
             got = n * 2
+            raw_src = self.sp.stage[:n]
+        trace_n = min(trace_n, read_n)   # stream mode caps read_n at one
+                                         # segment, so re-clamp after acquiring
         if time.monotonic() - self._raw_req < 5.0:
-            self.raw = np.array(self.sp.stage[:min(n, 1 << 16)], copy=True)
+            # Must come from the buffer THIS branch actually filled. Dual mode
+            # lands in _dual_stage, not sp.stage (see _dual_words), so sourcing
+            # /raw from sp.stage served the PREVIOUS frame's channel B -- the
+            # last thing the trace loop copied in. Anything that de-interleaves
+            # /raw (tools/channel_skew.py, diag_input.py) was then splitting one
+            # channel's record even/odd and calling the halves A and B.
+            self.raw = np.array(raw_src[:min(raw_src.size, 1 << 16)], copy=True)
         t_dma = time.monotonic() - t1
 
         # CUDA -- once per trace. Dual mode draws both channels, so both get
         # analysed; a GPU pass is a few ms, cheaper than making the user pick.
         t2 = time.monotonic()
+        # ChannelSel 0 is the FPGA's own counter, generated in fabric: it does
+        # NOT pass through the ADC's output inverter, so the kernel must not
+        # flip it. Every other channel carries converter data and must.
+        want_inv = bool(getattr(A, "OUTPUT_INVERT", False)) and ch != A.CH_TEST_RAMP
+        if getattr(self.sp, "invert", None) != want_inv:
+            try:
+                self.sp.set_invert(want_inv)
+            except Exception:
+                pass
+
         traces = []
         if self._pending:
             for name in ("A", "B"):
@@ -1059,6 +1914,35 @@ class Engine:
                            "tmin": self.sp.tmin, "tmax": self.sp.tmax,
                            "tmean": self.sp.tmean, "stats": self.sp.stats,
                            "nframes": int(self.sp.nframes)})
+        # RING TIME AXIS. The spectrum still comes from the record (it has to
+        # -- resolution is 1/T of the analysed block), but the time trace can
+        # be swapped for the whole-ring envelope, which is already built.
+        ring_span_s = 0.0
+        if streaming and int(cfg.get("trace_span_ring", 0)) and \
+           self.stream is not None and self.stream.env is not None:
+            env, ring = self.stream.env, self.stream.ring
+            lo, hi = ring.resident
+            for ci, t in enumerate(traces):
+                r = env.span(lo, hi, min(ci, env.nch - 1), self.trace_width)
+                if r is None:
+                    break
+                mn, mx, me, nseg = r
+                t["tmin"], t["tmax"], t["tmean"] = mn, mx, me
+                ring_span_s = nseg * env.seconds_per_seg
+
+        # Per-channel statistics, straight off the device: k_stats_fin writes
+        # [min, max, mean, std, std] over exactly the samples each channel's
+        # process() pass consumed, already decoded through s14() with the
+        # output-inversion flag applied.
+        if self._pending and traces:
+            self.dual = {}
+            for t in traces:
+                st = t.get("stats")
+                if st is None or not t["name"]:
+                    continue
+                self.dual[t["name"]] = {"min": int(st[0]), "max": int(st[1]),
+                                        "mean": float(st[2]), "std": float(st[3])}
+
         spec = traces[0]["spec"]
         t_gpu_wall = time.monotonic() - t2
 
@@ -1122,10 +2006,12 @@ class Engine:
         elif self.analysis is not None:
             self.analysis = None
 
-        disp, disp_f0, disp_f1 = log_display(shown, bin_hz, DISP_BINS)
+        want_log = bool(cfg.get("disp_log", 1))
+        _disp_fn = log_display if want_log else lin_display
+        disp, disp_f0, disp_f1 = _disp_fn(shown, bin_hz, DISP_BINS)
         # one display-decimated spectrum per trace; trace 0 is `shown`, the
         # EMA-averaged one that peaks and classification are taken from
-        disps = [disp] + [log_display(self._acc[i], bin_hz, DISP_BINS)[0]
+        disps = [disp] + [_disp_fn(self._acc[i], bin_hz, DISP_BINS)[0]
                           for i in range(1, len(traces))]
 
         zoom_meta = {"active": False, "bins": 0, "lo_hz": 0.0, "hi_hz": 0.0, "bin_hz": 0.0}
@@ -1150,7 +2036,9 @@ class Engine:
             "fs_hz": fs,
             "nbins": int(self.sp.nbins),          # true FFT resolution
             "disp_bins": int(len(disp)),          # length of the array actually sent
-            "disp_log": True,                     # log-spaced from disp_f0 to disp_f1
+            "disp_log": want_log,   # True: points log-spaced disp_f0..disp_f1
+                                    # False: linearly spaced. The client's axis
+                                    # MUST match, or every frequency is wrong.
             "disp_f0": disp_f0,
             "disp_f1": disp_f1,
             "zoom": zoom_meta,
@@ -1159,6 +2047,8 @@ class Engine:
             "n_traces": len(traces),
             "nframes": int(self.sp.nframes),
             "bin_hz": bin_hz,
+            "stream": self._stream_meta(streaming),
+            "adc": self.adc_health(),
             "acq": {
                 "capture_ms": t_cap * 1e3,
                 "capture_theory_ms": expect * 1e3,
@@ -1166,7 +2056,15 @@ class Engine:
                 "capture_samples": N,
                 "read_samples": read_n,
                 "read_pct": 100.0 * read_n / N if N else 0.0,
-                "trace_samples": trace_n,
+                # With the ring axis the trace no longer covers `trace_n`
+                # samples of the record -- it covers the whole resident ring.
+                # The UI derives the time axis from this, so it has to report
+                # the span actually drawn or the axis would lie.
+                "trace_samples": (int(ring_span_s * A.BASE_CLOCK_HZ)
+                                  if ring_span_s > 0 else trace_n),
+                "trace_span_ring": bool(ring_span_s > 0),
+                "trace_span_s": ring_span_s if ring_span_s > 0
+                                else (trace_n / A.BASE_CLOCK_HZ),
                 "fft_samples": min(need, read_n),
                 "dma_ms": t_dma * 1e3,
                 "dma_gbps": (nbytes / t_dma) / 1e9 if t_dma > 0 else 0,
@@ -1306,8 +2204,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # CORS: the Flutter client (flutter_client/) is a separate origin --
+        # served by `flutter run -d chrome`'s own dev port, or wherever its
+        # `flutter build web` output ends up -- and fetches this API cross-
+        # origin. This host is already only reachable on a private/VPN
+        # network (see README's NetBird section), so an open origin costs
+        # nothing that network access didn't already grant.
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        # CORS preflight for POST /control and /pn/control: a JSON body
+        # (Content-Type: application/json) is not a "simple" request, so the
+        # browser sends this first and refuses the real POST without a
+        # matching answer here.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         p = self.path.split("?")[0]
@@ -1407,6 +2324,79 @@ class Handler(BaseHTTPRequestHandler):
             out["cal_points"] = e._pn_acc_n
             return self._send(200, json.dumps(out).encode(),
                               "application/json")
+        if p == "/diag/status":
+            e = self.engine
+            try:
+                st = {"session": e.diag.state(), "adc": e.adc_health()}
+                if not e.mock and e.adc.has_adc_ctl:
+                    st["regs"] = {
+                        "reg10": e.adc.rd(A.REG_ADC_STATUS),
+                        "reg11": e.adc.rd(A.REG_RAMP_ERR_A),
+                        "reg12": e.adc.rd(A.REG_RAMP_ERR_B),
+                        "reg13": e.adc.rd(A.REG_DELAY),
+                        "reg6":  e.adc.rd(A.REG_FLAGS),
+                        "reg15": e.adc.rd(A.REG_DESIGN_ID)}
+                    # SPI reads are ~3.3 us each; three is cheap at 2 Hz
+                    st["adc_regs"] = {
+                        "0x0D": e.adc.adc_rd(A.ADC_TEST_MODE),
+                        "0x14": e.adc.adc_rd(A.ADC_OUTPUT_MODE),
+                        "0x17": e.adc.adc_rd(A.ADC_DCO_DELAY)}
+                    st["stored_tap"] = A.load_stored_tap()
+                    st["patterns"] = DG.PATTERNS
+            except Exception as ex:
+                st = {"error": f"{type(ex).__name__}: {ex}"}
+            return self._send(200, json.dumps(json_safe(st)).encode(),
+                              "application/json")
+        if p == "/diag/progress":
+            d = self.engine.diag
+            out = d.state()
+            try:
+                since = int(self.path.split("since=")[1].split("&")[0])
+            except Exception:
+                since = 0
+            out["points"] = d.points[since:since + 2048]
+            out["point_base"] = since
+            return self._send(200, json.dumps(json_safe(out)).encode(),
+                              "application/json")
+        if p in ("/diag/result.csv", "/diag/result.json"):
+            r = self.engine.diag.result
+            if r is None:
+                return self._send(404, b"no result yet", "text/plain")
+            if p.endswith(".csv"):
+                body = r.to_csv().encode()
+                if not body:
+                    return self._send(404, b"this result has no table",
+                                      "text/plain")
+                return self._send(200, body, "text/csv")
+            return self._send(200, json.dumps(json_safe(r.to_json())).encode(),
+                              "application/json")
+        if p == "/hw":
+            q = {}
+            if "?" in self.path:
+                for kv in self.path.split("?", 1)[1].split("&"):
+                    k, _, v = kv.partition("=")
+                    q[k] = v
+            try:
+                out = self.engine.hw_snapshot(dump=(q.get("dump") == "1"))
+            except Exception as ex:
+                out = {"error": f"{type(ex).__name__}: {ex}"}
+            return self._send(200, json.dumps(json_safe(out)).encode(),
+                              "application/json")
+        if p == "/adc":
+            e = self.engine
+            q = {}
+            if "?" in self.path:
+                for kv in self.path.split("?", 1)[1].split("&"):
+                    k, _, v = kv.partition("=")
+                    q[k] = v
+            out = {"health": e.adc_health()}
+            if q.get("dump") == "1":
+                try:
+                    out["registers"] = {k: v for k, v in e.adc_dump().items()}
+                except Exception as ex:
+                    out["dump_error"] = f"{type(ex).__name__}: {ex}"
+            return self._send(200, json.dumps(json_safe(out)).encode(),
+                              "application/json")
         if p == "/limits":
             return self._send(200, json.dumps({
                 "granularity": A.SAMPLE_GRANULARITY,
@@ -1446,6 +2436,110 @@ class Handler(BaseHTTPRequestHandler):
                     os._exit(0)
             threading.Thread(target=_restart, daemon=True).start()
             return
+        if p.startswith("/diag/"):
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                cfg = json.loads(self.rfile.read(n) or b"{}")
+                d = self.engine.diag
+                tok = cfg.get("token") or "anon"
+                act = p[len("/diag/"):]
+                if act == "enter":
+                    out = d.enter(tok)
+                elif act == "keepalive":
+                    out = d.keepalive(tok)
+                elif act == "leave":
+                    out = d.leave(tok)
+                elif act == "cancel":
+                    out = d.cancel(tok)
+                elif act == "run":
+                    out = d.start(tok, cfg.get("test"), cfg.get("params") or {})
+                elif act == "pattern":
+                    if not d.active or d.owner != tok:
+                        raise RuntimeError(
+                            "diagnostics lease lapsed or held by another"
+                            " client -- re-enter the tab")
+                    DG.set_pattern(self.engine.adc, int(cfg["pattern"]))
+                    out = {"pattern": self.engine.adc.adc_rd(A.ADC_TEST_MODE)}
+                elif act == "reg":
+                    if not d.active or d.owner != tok:
+                        raise RuntimeError(
+                            "diagnostics lease lapsed or held by another"
+                            " client -- re-enter the tab")
+                    adc = self.engine.adc
+                    addr = int(cfg["addr"])
+                    if "value" in cfg:
+                        # goes through the driver guards: 0x09 bit0 and 0x14
+                        adc.adc_wr_transfer(addr, int(cfg["value"]),
+                                            force=bool(cfg.get("force")))
+                    if cfg.get("transfer"):
+                        adc.adc_transfer()
+                    out = {"addr": addr, "value": adc.adc_rd(addr)}
+                elif act == "clear":
+                    if not d.active or d.owner != tok:
+                        raise RuntimeError(
+                            "diagnostics lease lapsed or held by another"
+                            " client -- re-enter the tab")
+                    self.engine.adc.ramp_clear()              # reg10: counters
+                    self.engine.adc.wr(A.REG_FLAGS, 0)        # reg6: stream flags
+                    out = {"cleared": True}
+                elif act == "tap":
+                    if not d.active or d.owner != tok:
+                        raise RuntimeError(
+                            "diagnostics lease lapsed or held by another"
+                            " client -- re-enter the tab")
+                    t = int(cfg["tap"])
+                    r = self.engine.adc.set_tap(t)
+                    if cfg.get("save"):
+                        A.save_stored_tap(t)
+                    out = {"tap": r, "saved": bool(cfg.get("save"))}
+                else:
+                    return self._send(404, b"not found", "text/plain")
+                return self._send(200, json.dumps(json_safe(out)).encode(),
+                                  "application/json")
+            except Exception as ex:
+                return self._send(400, json.dumps(
+                    {"error": f"{type(ex).__name__}: {ex}"}).encode(),
+                    "application/json")
+        if p == "/hw/control":
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                cfg = json.loads(self.rfile.read(n) or b"{}")
+                out = {"ok": True}
+                if "counter_test" in cfg:
+                    out["counter"] = self.engine.counter_test(cfg["counter_test"])
+                if "eye_scan" in cfg:
+                    e = cfg["eye_scan"] or {}
+                    out["eye"] = self.engine.eye_scan(
+                        step=e.get("step", 8), dwell=e.get("dwell", 0.01),
+                        nsamp=e.get("samples", 65536))
+                return self._send(200, json.dumps(json_safe(out)).encode(),
+                                  "application/json")
+            except Exception as ex:
+                return self._send(400, json.dumps(
+                    {"error": f"{type(ex).__name__}: {ex}"}).encode(),
+                    "application/json")
+        if p == "/adc/control":
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                cfg = json.loads(self.rfile.read(n) or b"{}")
+                out = {"ok": True}
+                if "tap" in cfg:
+                    out["tap"] = self.engine.adc_set_tap(
+                        cfg["tap"], save=bool(cfg.get("save_tap", False)))
+                if cfg.get("clear_flags"):
+                    out["status"] = self.engine.adc_clear_flags()
+                if "ramp_test" in cfg:
+                    secs = float(cfg["ramp_test"])
+                    if not (0.1 <= secs <= 120.0):
+                        raise ValueError("ramp_test seconds must be 0.1..120")
+                    out["ramp"] = self.engine.ramp_test(secs)
+                out["health"] = self.engine.adc_health()
+                return self._send(200, json.dumps(json_safe(out)).encode(),
+                                  "application/json")
+            except Exception as ex:
+                return self._send(400, json.dumps(
+                    {"error": f"{type(ex).__name__}: {ex}"}).encode(),
+                    "application/json")
         if p == "/pn/control":
             n = int(self.headers.get("Content-Length", 0))
             try:
@@ -1580,6 +2674,10 @@ def main():
                     help="floor on loop period in seconds (default 5 ms)")
     ap.add_argument("--replace", action="store_true",
                     help="stop an already-running instance and take over")
+    ap.add_argument("--tap", type=int, default=None,
+                    help="IDELAY tap to load at start-up; default is the value "
+                         "stored by tools/eye_scan.py --save. The FPGA does not "
+                         "retain it across reconfiguration.")
     ap.add_argument("--fast-dma", action="store_true",
                     help="use the resident DMA helper (native/xdma_shm_reader)"
                          " instead of spawning dma_from_device per frame."
@@ -1629,7 +2727,7 @@ def main():
     eng = Engine(nsamples=a.nsamples,
                  channel=A.CH_BOTH if a.mock_interferometer else a.channel,
                  nfft=a.nfft,
-                 min_period=a.min_period, fast_dma=a.fast_dma,
+                 min_period=a.min_period, fast_dma=a.fast_dma, tap=a.tap,
                  mock="interferometer" if a.mock_interferometer else a.mock,
                  mock_opts=dict(dnu_hz=a.mock_linewidth,
                                 drift_hz=a.mock_drift))

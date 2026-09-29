@@ -15,11 +15,24 @@
  * aligned heap buffer; the shm copy is plain CPU memcpy after DMA completes.
  *
  * Protocol (line-oriented, stdin/stdout):
- *   "R <addr> <nbytes>\n"  -> DMA read, copy to shm, reply "OK <nbytes>\n"
- *   "Q\n"                  -> exit 0
- *   any failure            -> reply "ERR <errno-msg>\n" (process keeps running)
+ *   "R <addr> <nbytes>\n"             -> DMA read, copy to shm offset 0
+ *   "R <addr> <nbytes> <shmoff>\n"    -> ... to shm offset <shmoff>
+ *        both reply "OK <nbytes>\n"
+ *   "Q\n"                             -> exit 0
+ *   any failure  -> reply "ERR <errno-msg>\n" (process keeps running)
  *
- * Usage: xdma_shm_reader <device> <shm_file> <max_bytes>
+ * The <shmoff> form exists for streaming: the caller sizes the shm as several
+ * segment slots and rotates through them, so the consumer can still be
+ * writing slot k while the next DMA lands in slot k+1. Without it every read
+ * had to wait for the previous buffer to be drained.
+ *
+ * Usage: xdma_shm_reader <device> <shm_file> <shm_bytes> [max_read_bytes]
+ *
+ * <shm_bytes> sizes the shared mapping (the caller's ring). [max_read_bytes]
+ * sizes the DMA bounce buffer and caps one read; it defaults to <shm_bytes>.
+ * They are separate because a streaming ring is gigabytes while a single read
+ * is one segment slice -- allocating a bounce buffer the size of a 30 GB ring
+ * would be absurd even lazily faulted.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -67,12 +80,16 @@ static ssize_t read_to_buffer(int fd, char *buffer, uint64_t size,
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <device> <shm_file> <max_bytes>\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        fprintf(stderr, "usage: %s <device> <shm_file> <shm_bytes> "
+                        "[max_read_bytes]\n", argv[0]);
         return 2;
     }
     const char *dev = argv[1], *shm_path = argv[2];
     uint64_t max_bytes = strtoull(argv[3], NULL, 0);
+    uint64_t max_read = (argc == 5) ? strtoull(argv[4], NULL, 0) : max_bytes;
+    if (max_read == 0 || max_read > max_bytes)
+        max_read = max_bytes;
 
     /* same open flags as the vendor tool. XSR_TEST_RDONLY=1 exists ONLY so
      * the protocol can be tested against a regular file (which O_TRUNC would
@@ -98,7 +115,8 @@ int main(int argc, char **argv)
 
     /* same allocator + alignment as the vendor tool */
     char *allocated = NULL;
-    if (posix_memalign((void **)&allocated, 4096, max_bytes + 4096)) {
+    /* sized to the largest SINGLE read, not to the ring */
+    if (posix_memalign((void **)&allocated, 4096, max_read + 4096)) {
         fprintf(stderr, "ERR memalign: %s\n", strerror(errno));
         return 1;
     }
@@ -106,19 +124,30 @@ int main(int argc, char **argv)
 
     /* line-buffered replies; unbuffered enough for a pipe */
     setvbuf(stdout, NULL, _IOLBF, 0);
-    printf("READY %llu\n", (unsigned long long)max_bytes);
+    printf("READY %llu %llu\n", (unsigned long long)max_bytes,
+           (unsigned long long)max_read);
 
     char line[128];
     while (fgets(line, sizeof line, stdin)) {
         if (line[0] == 'Q')
             break;
-        unsigned long long addr, nbytes;
-        if (sscanf(line, "R %llu %llu", &addr, &nbytes) != 2) {
+        unsigned long long addr, nbytes, shmoff = 0;
+        int got_args = sscanf(line, "R %llu %llu %llu", &addr, &nbytes, &shmoff);
+        if (got_args < 2) {
             printf("ERR bad command\n");
             continue;
         }
-        if (nbytes > max_bytes) {
-            printf("ERR size %llu > max %llu\n", nbytes,
+        if (got_args < 3)
+            shmoff = 0;
+        /* both halves of the bound check, and the sum, in unsigned 64-bit --
+         * shmoff + nbytes cannot wrap for any value fgets can deliver. */
+        if (nbytes > max_read) {
+            printf("ERR read %llu > max_read %llu\n", nbytes,
+                   (unsigned long long)max_read);
+            continue;
+        }
+        if (shmoff > max_bytes || shmoff + nbytes > max_bytes) {
+            printf("ERR size %llu at off %llu > shm %llu\n", nbytes, shmoff,
                    (unsigned long long)max_bytes);
             continue;
         }
@@ -127,7 +156,7 @@ int main(int argc, char **argv)
             printf("ERR dma read: %s\n", strerror(-got));
             continue;
         }
-        memcpy(shm, buffer, got);
+        memcpy(shm + shmoff, buffer, got);
         /* make the bytes visible to the Python mmap before the reply */
         __sync_synchronize();
         printf("OK %zd\n", got);

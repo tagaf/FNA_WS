@@ -15,8 +15,18 @@
 // ((int16_t)(x<<2))>>2 and scales by 1.75 V / 8192. Reading it as unsigned
 // makes a signal sitting near zero jump between ~0 and ~16383 whenever it
 // crosses zero, which looks like violent spikes and wrecks the spectrum.
+// Set from ADC register 0x14 bit 2 by adc_set_invert(). The converter on
+// this board inverts its digital output (measured 2026-09-29 against the
+// midscale / +FS / -FS reference patterns), so the code has to be flipped
+// before sign extension or every sample comes out negated and off by one.
+// It is a runtime constant, not a #define, because the FPGA's own test
+// counter (ChannelSel 0) does NOT pass through that inverter -- whoever
+// feeds counter data in must clear this first.
+__constant__ int c_invert;
+
 __device__ __forceinline__ float s14(unsigned short v){
     int i = (int)v;
+    if (c_invert) i ^= 0x3FFF;
     return (float)((i ^ 0x2000) - 0x2000);
 }
 #define MAXB 256
@@ -26,7 +36,9 @@ struct FftCtx {
     unsigned short *h_in;         // pinned
     unsigned short *d_raw;
     float *d_f, *d_win, *d_pow, *d_spec;
-    float *d_part;                // partial reductions
+    double *d_part;               // partial reductions (double: see k_stats)
+    float *d_stats;               // 8 floats: min,max,mean,std,std
+    float *d_fmean;               // per-frame means (Welch detrend)
     float *d_tmin, *d_tmax, *d_tmean;
     cufftComplex *d_c;
     int max_frames;
@@ -72,11 +84,19 @@ static int win_coeffs(int type,float*a){
 }
 
 // pass 1: partial sum / sumsq / min / max
-__global__ void k_stats(const unsigned short*x,int n,float*part){
-    __shared__ float ss[MAXB],sq[MAXB],mn[MAXB],mx[MAXB];
+// Sum and sum-of-squares accumulate in DOUBLE. In float32 the variance came
+// out of E[x^2]-mean^2, which cancels catastrophically once |mean| >> std --
+// exactly the shape of a DC-coupled detector signal. Measured before the fix
+// on 4 Mi samples: mean 4000 std 5.01 -> reported 6.62 (+32%); mean 8000 std
+// 2.02 -> reported 4.09 (+103%). The kernel is memory-bound on 16-bit loads,
+// so the FP64 adds hide under the load latency.
+__global__ void k_stats(const unsigned short*x,int n,double*part){
+    __shared__ double ss[MAXB],sq[MAXB];
+    __shared__ float mn[MAXB],mx[MAXB];
     int t=threadIdx.x, i=blockIdx.x*blockDim.x+t, st=gridDim.x*blockDim.x;
-    float s=0,q=0,a=1e30f,b=-1e30f;
-    for(int j=i;j<n;j+=st){ float v=s14(x[j]); s+=v; q+=v*v; a=fminf(a,v); b=fmaxf(b,v); }
+    double s=0.0,q=0.0; float a=1e30f,b=-1e30f;
+    for(int j=i;j<n;j+=st){ float v=s14(x[j]); s+=(double)v; q+=(double)v*(double)v;
+                            a=fminf(a,v); b=fmaxf(b,v); }
     ss[t]=s; sq[t]=q; mn[t]=a; mx[t]=b; __syncthreads();
     for(int d=blockDim.x/2; d>0; d>>=1){
         if(t<d){ ss[t]+=ss[t+d]; sq[t]+=sq[t+d];
@@ -84,21 +104,51 @@ __global__ void k_stats(const unsigned short*x,int n,float*part){
         __syncthreads();
     }
     if(t==0){ part[blockIdx.x]=ss[0]; part[gridDim.x+blockIdx.x]=sq[0];
-              part[2*gridDim.x+blockIdx.x]=mn[0]; part[3*gridDim.x+blockIdx.x]=mx[0]; }
+              part[2*gridDim.x+blockIdx.x]=(double)mn[0];
+              part[3*gridDim.x+blockIdx.x]=(double)mx[0]; }
 }
-__global__ void k_stats_fin(float*part,int nb,float*out,int n){
-    float s=0,q=0,a=1e30f,b=-1e30f;
+__global__ void k_stats_fin(const double*part,int nb,float*out,int n){
+    double s=0.0,q=0.0,a=1e30,b=-1e30;
     for(int i=0;i<nb;i++){ s+=part[i]; q+=part[nb+i];
-        a=fminf(a,part[2*nb+i]); b=fmaxf(b,part[3*nb+i]); }
-    float m=s/n; float var=q/n-m*m; if(var<0) var=0;
-    out[0]=a; out[1]=b; out[2]=m; out[3]=sqrtf(var); out[4]=sqrtf(var);
+        a=fmin(a,part[2*nb+i]); b=fmax(b,part[3*nb+i]); }
+    double m=s/n;
+    // still the E[x^2]-m^2 identity, but every term is double now: at the
+    // worst case above (m=8000, var=4) the cancellation loses ~10 of the 15
+    // significant digits and ~5 remain, against float32 losing all of them.
+    double var=q/(double)n - m*m; if(var<0.0) var=0.0;
+    out[0]=(float)a; out[1]=(float)b; out[2]=(float)m;
+    out[3]=(float)sqrt(var); out[4]=(float)sqrt(var);
 }
 
-// convert + DC-remove + window, framed for the batched FFT
+// Mean of each FFT frame, one block per frame.
+//
+// Welch detrends PER SEGMENT (scipy.signal.welch's detrend='constant'), not
+// once for the whole record. Subtracting a single global mean leaves every
+// frame carrying its own offset relative to it, and on a drifting signal --
+// a fringe, a thermal ramp, exactly what this instrument looks at -- that
+// residual lands in bin 1. Measured on a 2000-code drift: bin 1 read
+// -15.25 dBFS against -33.69 with per-frame removal, an 18.4 dB error.
+// Bins 2 and up were unaffected, because the Hann window confines the
+// residual to the first couple of bins.
+__global__ void k_frame_mean(const unsigned short*x,int nfft,int frames,float*fm){
+    int f=blockIdx.x; if(f>=frames) return;
+    __shared__ double sm[MAXB];
+    double s=0.0;
+    for(int i=threadIdx.x;i<nfft;i+=blockDim.x)
+        s+=(double)s14(x[(size_t)f*nfft+i]);
+    sm[threadIdx.x]=s; __syncthreads();
+    for(int d=blockDim.x/2;d>0;d>>=1){
+        if(threadIdx.x<d) sm[threadIdx.x]+=sm[threadIdx.x+d];
+        __syncthreads();
+    }
+    if(threadIdx.x==0) fm[f]=(float)(sm[0]/(double)nfft);
+}
+
+// convert + per-frame DC-remove + window, framed for the batched FFT
 __global__ void k_win(const unsigned short*x,float*y,const float*w,
-                      int nfft,int frames,const float*stats){
+                      int nfft,int frames,const float*fmean){
     int i=blockIdx.x*blockDim.x+threadIdx.x, tot=nfft*frames;
-    if(i<tot) y[i]=(s14(x[i])-stats[2])*w[i%nfft];   // stats[2] = mean
+    if(i<tot) y[i]=(s14(x[i])-fmean[i/nfft])*w[i%nfft];
 }
 
 // average |X|^2 across frames
@@ -109,9 +159,21 @@ __global__ void k_pow(const cufftComplex*c,float*p,int nbins,int frames){
     for(int f=0;f<frames;f++){ cufftComplex v=c[(size_t)f*nbins+i]; acc+=v.x*v.x+v.y*v.y; }
     p[i]=acc/frames;
 }
-__global__ void k_db(const float*p,float*db,int nbins,float norm){
+// A real-input FFT folds each positive frequency onto its negative twin, so
+// a tone of amplitude A puts A/2 in each -- hence the factor 2. DC and
+// Nyquist have NO twin: they are their own mirror, and doubling them
+// over-reports by exactly 6.02 dB. Measured before the fix: a full-amplitude
+// Nyquist tone (cos(pi n)) read -6.227 dBFS against a true -12.247.
+// DC is normally invisible because k_win removes the mean first, but it is
+// wrong for the same reason and is corrected here too.
+__global__ void k_db(const float*p,float*db,int nbins,float norm,int nfft){
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<nbins){ float a=sqrtf(p[i])*norm; db[i]=20.0f*log10f(fmaxf(a,1e-9f)/FS_CODES); }
+    if(i>=nbins) return;
+    // nfft is even for every size this engine uses, so bin nbins-1 is exactly
+    // Nyquist. Guard on the parity anyway rather than assume it.
+    bool unpaired = (i==0) || ((nfft%2)==0 && i==nbins-1);
+    float a=sqrtf(p[i])*(unpaired ? 0.5f*norm : norm);
+    db[i]=20.0f*log10f(fmaxf(a,1e-9f)/FS_CODES);
 }
 
 // min/max envelope decimation: one block per output column
@@ -157,6 +219,12 @@ static int apply_window(FftCtx*c,int type){
 }
 
 extern "C" int adc_set_window(FftCtx*c,int type){ return apply_window(c,type); }
+
+extern "C" int adc_set_invert(FftCtx*c,int on){
+    (void)c;
+    int v = on ? 1 : 0;
+    return cudaMemcpyToSymbol(c_invert,&v,sizeof(int)) == cudaSuccess ? 0 : -1;
+}
 extern "C" float adc_win_enbw(FftCtx*c){ return c->win_enbw; }
 
 FftCtx* adc_create(int nfft,int maxs,int tw){
@@ -169,7 +237,9 @@ FftCtx* adc_create(int nfft,int maxs,int tw){
     CK(cudaMalloc(&c->d_win,(size_t)nfft*sizeof(float)));
     CK(cudaMalloc(&c->d_pow,(size_t)c->nbins*sizeof(float)));
     CK(cudaMalloc(&c->d_spec,(size_t)c->nbins*sizeof(float)));
-    CK(cudaMalloc(&c->d_part,(size_t)4*MAXB*sizeof(float)+8*sizeof(float)));
+    CK(cudaMalloc(&c->d_part,(size_t)4*MAXB*sizeof(double)));
+    CK(cudaMalloc(&c->d_stats,8*sizeof(float)));
+    CK(cudaMalloc(&c->d_fmean,(size_t)c->max_frames*sizeof(float)));
     CK(cudaMalloc(&c->d_tmin,(size_t)tw*sizeof(float)));
     CK(cudaMalloc(&c->d_tmax,(size_t)tw*sizeof(float)));
     CK(cudaMalloc(&c->d_tmean,(size_t)tw*sizeof(float)));
@@ -178,6 +248,7 @@ FftCtx* adc_create(int nfft,int maxs,int tw){
     CK(cudaEventCreate(&c->e0)); CK(cudaEventCreate(&c->e1)); CK(cudaEventCreate(&c->e2));
     CK(cudaEventCreate(&c->e3)); CK(cudaEventCreate(&c->e4));
     if(apply_window(c,WIN_HANN)!=0) return NULL;
+    { int z=0; cudaMemcpyToSymbol(c_invert,&z,sizeof(int)); }
     return c;
 }
 
@@ -209,13 +280,14 @@ int adc_process(FftCtx*c,int nsamples,int max_frames,int trace_n,
 
     int nb=64;
     k_stats<<<nb,MAXB,0,c->s>>>(c->d_raw,nsamples,c->d_part);
-    k_stats_fin<<<1,1,0,c->s>>>(c->d_part,nb,c->d_part+4*MAXB,nsamples);
+    k_stats_fin<<<1,1,0,c->s>>>(c->d_part,nb,c->d_stats,nsamples);
 
     int tot=nfft*frames;
-    // mean is read on-device (stats[2]) - no host round-trip, no mid-pipeline
-    // cudaStreamSynchronize stalling the stream every frame
+    // means are computed and consumed on-device - no host round-trip, no
+    // mid-pipeline cudaStreamSynchronize stalling the stream every frame
+    k_frame_mean<<<frames,MAXB,0,c->s>>>(c->d_raw,nfft,frames,c->d_fmean);
     k_win<<<(tot+255)/256,256,0,c->s>>>(c->d_raw,c->d_f,c->d_win,nfft,frames,
-                                        c->d_part+4*MAXB);
+                                        c->d_fmean);
     k_env<<<c->tw,MAXB,0,c->s>>>(c->d_raw,trace_n,c->d_tmin,c->d_tmax,
                                  c->d_tmean,c->tw);
     cudaEventRecord(c->e2,c->s);
@@ -226,13 +298,13 @@ int adc_process(FftCtx*c,int nsamples,int max_frames,int trace_n,
     k_pow<<<(c->nbins+255)/256,256,0,c->s>>>(d_c,c->d_pow,c->nbins,frames);
     // amplitude = 2*|X|/sum(w) -- coherent gain depends on the window
     k_db<<<(c->nbins+255)/256,256,0,c->s>>>(c->d_pow,c->d_spec,c->nbins,
-                                            2.0f/c->win_sum);
+                                            2.0f/c->win_sum,nfft);
     cudaMemcpyAsync(spec,c->d_spec,(size_t)c->nbins*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmin,c->d_tmin,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmax,c->d_tmax,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaMemcpyAsync(tmean,c->d_tmean,(size_t)c->tw*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     float h_stats[5];
-    cudaMemcpyAsync(h_stats,c->d_part+4*MAXB,5*sizeof(float),cudaMemcpyDeviceToHost,c->s);
+    cudaMemcpyAsync(h_stats,c->d_stats,5*sizeof(float),cudaMemcpyDeviceToHost,c->s);
     cudaEventRecord(c->e4,c->s);
     cudaStreamSynchronize(c->s);
 
@@ -250,7 +322,7 @@ void adc_destroy(FftCtx*c){
     if(!c) return;
     if(c->plan_frames) cufftDestroy(c->plan);
     cudaFreeHost(c->h_in); cudaFree(c->d_raw); cudaFree(c->d_f); cudaFree(c->d_win);
-    cudaFree(c->d_pow); cudaFree(c->d_spec); cudaFree(c->d_part);
+    cudaFree(c->d_pow); cudaFree(c->d_spec); cudaFree(c->d_part); cudaFree(c->d_stats); cudaFree(c->d_fmean);
     cudaFree(c->d_tmin); cudaFree(c->d_tmax); cudaFree(c->d_tmean); cudaFree(c->d_c);
     cudaStreamDestroy(c->s); free(c);
 }

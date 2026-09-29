@@ -104,6 +104,21 @@ tr:last-child td{border-bottom:0}
 .legend{display:flex;gap:12px;flex-wrap:wrap;padding:6px 12px 10px;font-size:10.5px;color:var(--dim)}
 .legend span{display:flex;align-items:center;gap:4px;white-space:nowrap}
 .legend i{width:8px;height:8px;border-radius:2px;display:inline-block}
+.tapctl{display:flex;gap:.35rem;align-items:center}
+.tapctl input{width:5.5rem}
+.tapctl .muted{font-size:.85em;opacity:.7}
+.notice{display:none;margin:0 0 10px;padding:8px 12px;border-radius:6px;
+        background:#3a2d12;border:1px solid #6b5420;color:#ffd79a;font-size:12.5px}
+.notice.on{display:block}
+.params{margin:8px 0;font-size:12px;display:flex;flex-wrap:wrap;gap:8px}
+.params label{display:flex;gap:4px;align-items:center;color:var(--dim)}
+.params input,.params select{width:6.5rem}
+.progwrap{height:6px;background:#14211f;border-radius:3px;overflow:hidden;margin-top:8px}
+.progbar{height:100%;width:0;background:#1d6b60;transition:width .2s}
+label.inline{display:inline-flex;gap:4px;align-items:center;color:var(--dim)}
+#diagPlot,#diagPatPlot,#diagBits{width:100%;display:block;margin-top:8px}
+.eyeplot{font-family:var(--mono);font-size:10px;line-height:1.25;white-space:pre;
+         overflow-x:auto;margin:10px 0 0;color:var(--dim)}
 </style></head><body>
 
 <header>
@@ -120,6 +135,7 @@ tr:last-child td{border-bottom:0}
   <button class="tabbtn active" data-tab="main">Main</button>
   <button class="tabbtn" data-tab="pn">Phase noise</button>
   <button class="tabbtn" data-tab="diag">Diagnostics</button>
+  <button class="tabbtn" data-tab="hw">FPGA / ADC</button>
 </div>
 <div id="err"></div>
 
@@ -138,7 +154,7 @@ tr:last-child td{border-bottom:0}
         <canvas id="cTime"></canvas>
       </div>
       <div class="card">
-        <h2>Spectrum — log/log (CUDA cuFFT)
+        <h2>Spectrum <span id="specAxis">— log/log</span> (CUDA cuFFT)
           <span>
             <label class="chk" title="Persistence / density display, as on a real-time spectrum analyser. Every trace is accumulated into a frequency x amplitude histogram and coloured by how often each cell is hit, so rare transients stay visible and the steady noise floor separates from intermittent signals. Accumulated in the browser, so it costs no extra bandwidth.">
               persist
@@ -156,6 +172,31 @@ tr:last-child td{border-bottom:0}
       <div class="card">
         <h2>Control</h2>
         <div class="ctl">
+          <label title="Stream: the FPGA fills its 16-segment DDR ring continuously and the display samples the NEWEST segment at a fixed cadence, so the frame rate is constant and each frame shows fresher data. Block: the legacy one-shot arm/wait/DMA cycle, where the frame rate falls with record length.">Acquisition</label>
+          <select id="mode">
+            <option value="1">stream — continuous, constant rate</option>
+            <option value="0">block — legacy one-shot</option>
+          </select>
+          <label title="Stream mode only. 'record' draws the time trace over the record you selected. 'full RAM ring' draws it over EVERY segment held in RAM -- seconds of signal -- using per-segment min/max summaries built as each segment arrives, so the axis can span the whole buffer without pulling gigabytes through the CPU each frame. Those summaries are subsampled, so they show shape and drift faithfully but are not a guarantee of catching a single-sample glitch; use the record trace for that.">Time axis</label>
+          <select id="trace_span_ring">
+            <option value="0">record</option>
+            <option value="1">full RAM ring</option>
+          </select>
+          <label title="Stream mode only. 'full record' shows every sample of the record you asked for, so a long record costs more per frame and the (still constant) frame rate drops. Choosing a window caps how much of each record the time-trace envelope spans, which holds a higher frame rate at the cost of showing less of the record. The FFT is unaffected either way.">Trace window</label>
+          <select id="stream_window"></select>
+          <label title="Display cadence. In stream mode this is held constant regardless of record length; what changes under load is how much data each frame skips, not how often frames arrive. In block mode it is only a ceiling.">Frame rate</label>
+          <select id="fps"></select>
+          <label title="FPGA IDELAY tap for the ADC data bus. Measure it with tools/eye_scan.py; the FPGA does NOT retain it across reconfiguration, so the server re-applies a stored value at start-up. 'save' also writes it to ~/.adc_capture.conf.">ADC tap</label>
+          <span class="tapctl">
+            <input id="adc_tap" type="number" min="0" max="511" step="1" value="0">
+            <button id="adc_tap_set" type="button">set</button>
+            <button id="adc_tap_save" type="button">save</button>
+          </span>
+          <label title="Puts the ADC into its ramp test pattern and asks the FPGA checker how many samples failed to step by +1. Every sample of both channels is checked. Acquisition is paused for the duration and restored afterwards.">ADC ramp test</label>
+          <span class="tapctl">
+            <button id="adc_ramp" type="button">run 5 s</button>
+            <span id="adc_ramp_out" class="muted">—</span>
+          </span>
           <label>Channel</label>
           <select id="channel">
             <option value="1">1 — ADC A</option>
@@ -165,8 +206,11 @@ tr:last-child td{border-bottom:0}
           </select>
           <label>Samples</label>
           <select id="nsamples"></select>
-          <label title="Does NOT change the sample rate. It gates only the capture FSM's sample counter, so the data is always 250 Msps and the capture just takes (n+1) times longer. Leave at 0.">Capture stretch</label>
-          <select id="speed"></select>
+          <label title="Spectrum frequency axis. Log spreads the low decades a long record buys you; linear matches a conventional analyser and is easier to read when the interesting content is all near the top of the band. The server re-pools the spectrum to match, so the points line up either way.">FFT x axis</label>
+          <select id="disp_log">
+            <option value="1">log</option>
+            <option value="0">linear</option>
+          </select>
           <label>FFT size</label>
           <select id="nfft"></select>
           <label>FFT frames</label>
@@ -302,6 +346,76 @@ tr:last-child td{border-bottom:0}
   </div>
 </div>
 
+<div id="tabHw" class="tabpanel" style="display:none">
+  <div id="diagNotice" class="notice">Diagnostics active — acquisition is stopped and the
+    controls on the other tabs are locked. Leave this tab to release the board.</div>
+
+  <div class="row">
+    <div class="card">
+      <h2>Status <em id="diagLease">–</em></h2>
+      <table id="tDiagStatus"></table>
+      <div class="ctl" style="margin-top:8px">
+        <label>Counters / flags</label>
+        <span class="tapctl"><button id="diagClear" type="button">clear reg10 + reg6</button></span>
+        <label title="FPGA IDELAY tap. 'save' stores it so every tool applies it at start-up; the FPGA loses it on reconfiguration.">Data delay</label>
+        <span class="tapctl">
+          <input id="diagTap" type="number" min="0" max="511" step="1" value="120">
+          <button id="diagTapSet" type="button">apply</button>
+          <button id="diagTapSave" type="button">save</button>
+        </span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Tests <em id="diagBusy"></em></h2>
+      <div id="diagTests" class="ctl"></div>
+      <div id="diagParams" class="params"></div>
+      <div class="progwrap"><div id="diagBar" class="progbar"></div></div>
+      <div class="tapctl" style="margin-top:6px">
+        <button id="diagRun" type="button">run</button>
+        <button id="diagCancel" type="button" disabled>cancel</button>
+        <span id="diagMsg" class="muted">idle</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>Result <em id="diagVerdict"></em>
+        <button id="diagCsv" class="tabbtn" type="button">CSV</button>
+        <button id="diagJson" class="tabbtn" type="button">JSON</button></h2>
+      <div id="diagSummary" class="muted">no test run yet</div>
+      <canvas id="diagPlot" height="260"></canvas>
+      <div id="diagTable"></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>Test pattern &amp; capture</h2>
+      <div class="ctl">
+        <label title="ADC register 0x0D, applied immediately with a transfer.">Pattern</label>
+        <select id="diagPattern"></select>
+        <label>Samples</label>
+        <select id="diagCapN"></select>
+        <label>Capture</label>
+        <span class="tapctl">
+          <button id="diagCap" type="button">capture</button>
+          <label class="inline"><input id="diagAuto" type="checkbox"> auto 2 Hz</label>
+        </span>
+      </div>
+      <canvas id="diagPatPlot" height="230"></canvas>
+      <div id="diagPatInfo" class="muted"></div>
+      <canvas id="diagBits" height="150"></canvas>
+      <pre id="diagRaw" class="eyeplot"></pre>
+    </div>
+    <div class="card">
+      <h2>FPGA registers</h2><table id="tHwRegs"></table>
+      <h2 style="margin-top:12px">Link &amp; host</h2><table id="tHwLink"></table>
+    </div>
+  </div>
+</div>
+
 <div id="tabDiag" class="tabpanel" style="display:none">
   <div class="diaglayout">
     <div class="card"><h2>GPU / CUDA</h2><table id="tGpu"></table></div>
@@ -338,6 +452,11 @@ document.querySelectorAll('.tabbtn').forEach(b=>b.addEventListener('click',()=>{
   $('tabMain').style.display=t==='main'?'':'none';
   $('tabPn').style.display=t==='pn'?'':'none';
   $('tabDiag').style.display=t==='diag'?'':'none';
+  $('tabHw').style.display=t==='hw'?'':'none';
+  // Entering takes the board; leaving gives it back and restores the ADC.
+  if(t==='hw'){ hwRefresh(); hwTimer=hwTimer||setInterval(hwRefresh,2000);
+                diagBuildTests(); diagEnter(); }
+  else { if(hwTimer){clearInterval(hwTimer);hwTimer=null;} if(diagActive)diagLeave(); }
   pnActive=(t==='pn');
   // /pn is ~40 kB of JSON that only this tab consumes, so it is polled only
   // while the tab is on screen -- and polled immediately on arrival rather
@@ -375,7 +494,7 @@ function buildNsampleOpts(maxSamples){
   MAX_SAMPLES=maxSamples;
   let vals=NSAMPLE_BASE.filter(v=>v<=maxSamples);
   if(!vals.includes(maxSamples))vals.push(maxSamples);
-  const fs=250e6/((+($('speed')&&$('speed').value)||0)+1);
+  const fs=250e6;   // Speed_Set is forced to 0 (spec 8.1), so fs is fixed
   const cur=+$('nsamples').value||1048576;
   opts($('nsamples'),vals,
        v=>v.toLocaleString()+' · '+fmtDur(v/fs)+(v===maxSamples?' — MAX':''),
@@ -386,11 +505,12 @@ buildNsampleOpts(MAX_SAMPLES); // sane default before /limits answers
 fetch('/limits',{cache:'no-store'}).then(r=>r.json()).then(lim=>{
   buildNsampleOpts(lim.max_samples);
 }).catch(()=>{});
-// Speed_Set does NOT change the sample rate: it gates only the sample
-// counter, not the FIFO write enable, so DDR always gets 250 Msps data and
-// the capture simply takes (n+1)x longer. See NOTES.md #26.
-opts($('speed'),[0,1,3,7,15,31,63,255],
-     v=>v===0?'0 — normal':`${v} — ${v+1}× slower capture, same 250 Msps`,0);
+// The Speed_Set control is gone. It never changed the sample rate (it gates
+// the FSM's sample counter, not the FIFO write enable, so DDR always got
+// 250 Msps -- NOTES.md #26), and the 2026-09-28 streaming spec section 8.1
+// states a non-zero value CORRUPTS block lengths on this bitstream. The
+// server now rejects any non-zero value outright, so there was nothing left
+// for the control to select but a broken capture.
 opts($('avg'),[1,2,4,8,16,32],v=>v==1?'1 (off)':v+'\u00d7 EMA',4);
 opts($('classify'),[0,1],v=>v?'on — label noise sources':'off',0);
 opts($('persist'),[0,0.5,2,10,-1],
@@ -402,7 +522,452 @@ opts($('max_frames'),[1,2,4,8,16,32,64,128,256],v=>v==1?'1 (single FFT)':v+'\u00
 function fmtDur(sec){const [k,u]=axTimeUnit(sec);return axNum(sec*k)+' '+u}
 
 // ---- pending/applied confirmation for control changes
-const CTL_IDS=['channel','nsamples','speed','nfft','avg','max_frames','classify','pfa_exp'];
+// ------------------------------------------------- ADC/FPGA diagnostics
+// Entering this tab takes a LEASE on the board: acquisition stops and the
+// other tabs' controls lock. The transport is polling, not a websocket, so
+// there is no disconnect event -- the lease is renewed every 2 s and the
+// server releases the board (restoring the ADC) if renewals stop. Closing the
+// tab, navigating away and losing the network all look the same, which is the
+// behaviour we want.
+const DIAG_TOKEN = 'ui-' + Math.random().toString(36).slice(2);
+let hwTimer=null;
+const hwRow=(k,v,cls)=>`<tr><td>${k}</td><td class="${cls||''}">${v}</td></tr>`;
+const hwHex=v=>'0x'+(v>>>0).toString(16).toUpperCase().padStart(8,'0');
+
+// The raw FPGA register file and the link state, beside the decoded status
+// panel. Polled only while this tab is visible: 16 MMIO reads plus sysfs.
+function hwRefresh(){
+  fetch('/hw').then(r=>r.json()).then(d=>{
+    if(d.error){$('tHwRegs').innerHTML=hwRow('error',d.error,'v-bad');return;}
+    if(d.mock){$('tHwRegs').innerHTML=hwRow('mode','mock — no hardware','v-warn');return;}
+    $('tHwRegs').innerHTML=(d.regs||[]).map(r=>{
+      const bad=/NOT |MUST BE|expected|saturated/.test(r.decode||'');
+      return `<tr><td>${r.name}</td><td class="mono">${hwHex(r.value)}</td>`+
+             `<td class="${bad?'v-bad':''}">${r.decode||''}</td></tr>`;
+    }).join('');
+    const L=d.link||{};
+    $('tHwLink').innerHTML=
+      hwRow('PCIe link',(L.speed||'?')+' x'+(L.width||'?'),
+            (L.width==='4'&&/8\.0/.test(L.speed||''))?'v-good':'v-warn')+
+      hwRow('max',(L.max_speed||'?')+' x'+(L.max_width||'?'))+
+      hwRow('enabled',L.enabled==='1'?'yes':'NO',L.enabled==='1'?'v-good':'v-bad')+
+      hwRow('driver',L.driver||'none',L.driver?'':'v-bad')+
+      hwRow('DMA path',d.dma_path||'?')+
+      hwRow('segment',(d.seg_bytes||0).toLocaleString()+' B x '+(d.nseg||0))+
+      hwRow('reg alias',(d.alias_bytes||0)+' B');
+  }).catch(e=>{$('tHwRegs').innerHTML=hwRow('error',String(e),'v-bad');});
+}
+let diagTimer=null, diagKA=null, diagPoll=null, diagAutoT=null;
+let diagActive=false, diagRunning=false, diagResult=null, diagPoints=[];
+let diagSel='spi_selftest', diagPatData=null;
+
+const DIAG_TESTS=[
+  ['spi_selftest','SPI self-test',[]],
+  ['register_dump','ADC register dump',
+     [['lo','from','hex','0x00'],['hi','to','hex','0x3A']]],
+  ['ramp_check','FPGA ramp checker',
+     [['seconds','seconds','num',60]]],
+  ['eye_scan_fpga','Eye scan (FPGA checker)',
+     [['lo','tap from','num',0],['hi','tap to','num',512],
+      ['step','step','num',4],['dwell','dwell s','num',0.010],
+      ['ps_per_tap','ps/tap','num',6.25]]],
+  ['eye_scan_host','Eye scan (host check)',
+     [['lo','tap from','num',0],['hi','tap to','num',512],
+      ['step','step','num',4],['samples','samples','num',65536],
+      ['ps_per_tap','ps/tap','num',6.25]]],
+  ['dco_sweep','DCO delay sweep',
+     [['step','tap step','num',16],['samples','samples','num',16384]]],
+  ['counter_test','Datapath counter test',
+     [['nsamples','samples','num',1048576]]],
+  ['stream_selftest','Streaming self-test',
+     [['seconds','seconds','num',10],['channel','ChannelSel','num',0],
+      ['ram_gb','ring GB','num',1]]],
+  ['channel_quality','Channel identity / quality',
+     [['nsamples','samples','num',262144]]],
+];
+const DIAG_BYNAME={}; DIAG_TESTS.forEach(t=>DIAG_BYNAME[t[0]]=t);
+
+// A lapsed lease must not wedge the tab. Any ownership failure re-enters once
+// and retries: the board comes back, acquisition stops again, and the click
+// the user just made still happens.
+function diagPost(path,body,_retry){
+  body=Object.assign({token:DIAG_TOKEN},body||{});
+  return fetch('/diag/'+path,{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json().then(j=>({ok:r.ok,j})))
+    .then(({ok,j})=>{
+      const lapsed = !ok && /lease lapsed|not the diagnostics owner/i.test(j.error||'');
+      if(lapsed && !_retry && path!=='enter' && path!=='leave'){
+        return diagPost('enter',{},true).then(()=>diagPost(path,body,true));
+      }
+      return {ok,j};
+    });
+}
+function diagEnter(){
+  diagPost('enter',{}).then(({ok,j})=>{
+    diagActive=ok; $('diagNotice').classList.toggle('on',ok);
+    diagLockOthers(ok);
+    if(!ok)diagSay(j.error||'could not take the board','v-bad');
+  });
+  diagKA=diagKA||setInterval(()=>{
+    // Skip while hidden: the browser throttles us anyway, and letting the
+    // lease lapse deliberately hands the board back rather than holding it
+    // against a tab nobody is looking at.
+    if(!document.hidden) diagPost('keepalive',{});
+  },2000);
+  diagTimer=diagTimer||setInterval(diagStatus,500);
+  diagStatus();
+}
+function diagLeave(){
+  if(diagKA){clearInterval(diagKA);diagKA=null;}
+  if(diagTimer){clearInterval(diagTimer);diagTimer=null;}
+  if(diagPoll){clearInterval(diagPoll);diagPoll=null;}
+  if(diagAutoT){clearInterval(diagAutoT);diagAutoT=null;$('diagAuto').checked=false;}
+  diagPost('leave',{}).then(()=>{});
+  diagActive=false; $('diagNotice').classList.remove('on'); diagLockOthers(false);
+}
+// lock the acquisition controls on the other tabs while we hold the board
+function diagLockOthers(on){
+  CTL_IDS.concat(['persist','zoomLo','zoomHi']).forEach(id=>{
+    const el=$(id); if(el)el.disabled=on;
+  });
+  ['runBtn','trigBtn','stopBtn'].forEach(id=>{const el=$(id); if(el)el.disabled=on;});
+}
+function diagSay(t,cls){const e=$('diagMsg'); e.textContent=t; e.className=cls||'muted';}
+
+function diagStatus(){
+  fetch('/diag/status').then(r=>r.json()).then(d=>{
+    if(d.error){$('tDiagStatus').innerHTML=hwRow('error',d.error,'v-bad');return;}
+    const a=d.adc||{},R=d.regs||{},X=d.adc_regs||{},S=d.session||{};
+    $('diagLease').textContent = S.active
+      ? `lease ${S.lease_s.toFixed(1)} s` : 'not held';
+    if(!R.reg15){$('tDiagStatus').innerHTML=hwRow('status',a.reason||'no ADC control','v-warn');return;}
+    const om=X['0x14']||0, fmt={0:'offset binary',1:"two's complement",2:'gray'}[om&3]||'reserved';
+    const dco=X['0x17']||0;
+    $('tDiagStatus').innerHTML=
+      hwRow('design ID',hwHex(R.reg15),R.reg15===0xAD964302?'v-good':'v-bad')+
+      hwRow('capture clock',(R.reg10&1)?'locked':'NOT LOCKED',(R.reg10&1)?'v-good':'v-bad')+
+      hwRow('IDELAYCTRL',(R.reg10&8)?'ready':'NOT READY',(R.reg10&8)?'v-good':'v-bad')+
+      hwRow('overrange A',(R.reg10&2)?'YES':'no',(R.reg10&2)?'v-bad':'v-good')+
+      hwRow('overrange B',(R.reg10&4)?'YES':'no',(R.reg10&4)?'v-bad':'v-good')+
+      hwRow('data delay (reg13)',(R.reg13&0x1FF)+' requested / '+((R.reg13>>16)&0x1FF)+
+            ' calibrated',((R.reg13&0x1FF)===((R.reg13>>16)&0x1FF))?'':'v-warn')+
+      hwRow('stored tap',d.stored_tap===null?'none':d.stored_tap)+
+      hwRow('test mode (0x0D)','0x'+(X['0x0D']||0).toString(16).toUpperCase().padStart(2,'0')
+            +' — '+(diagPatName(X['0x0D'])||'?'),(X['0x0D']===0)?'v-good':'v-warn')+
+      hwRow('output mode (0x14)','0x'+om.toString(16).toUpperCase().padStart(2,'0')+
+            ' — '+fmt+(om&4?', INVERTED':', normal'),(om&3)===1?'':'v-bad')+
+      hwRow('DCO delay (0x17)',(dco&0x80)?(((dco&0x1F)+1)*100)+' ps':'off',
+            (dco&0x80)?'v-warn':'v-good')+
+      hwRow('ramp errors A (reg11)',R.reg11===0xFFFFFFFF?'saturated':R.reg11.toLocaleString(),
+            R.reg11?'v-bad':'v-good')+
+      hwRow('ramp errors B (reg12)',R.reg12===0xFFFFFFFF?'saturated':R.reg12.toLocaleString(),
+            R.reg12?'v-bad':'v-good')+
+      hwRow('stream flags (reg6)',R.reg6?('0x'+R.reg6.toString(16)):'clear',
+            R.reg6?'v-bad':'v-good');
+    if(d.patterns && !$('diagPattern').options.length){
+      opts($('diagPattern'),d.patterns.map(p=>p[0]),
+           v=>'0x'+v.toString(16).toUpperCase().padStart(2,'0')+' — '+diagPatName(v),0);
+      $('diagPattern').value=String(X['0x0D']||0);
+    }
+    const t=$('diagTap'); if(t && document.activeElement!==t) t.value=R.reg13&0x1FF;
+  }).catch(()=>{});
+}
+let DIAG_PATTERNS=[];
+function diagPatName(v){
+  const p=DIAG_PATTERNS.find(x=>x[0]===v); return p?p[1]:null;
+}
+fetch('/diag/status').then(r=>r.json()).then(d=>{DIAG_PATTERNS=d.patterns||[];}).catch(()=>{});
+// ---- test selection, parameters, run/cancel
+function diagBuildTests(){
+  $('diagTests').innerHTML = DIAG_TESTS.map(t=>
+    `<button class="tabbtn diagT" data-t="${t[0]}">${t[1]}</button>`).join(' ');
+  document.querySelectorAll('.diagT').forEach(b=>b.addEventListener('click',()=>{
+    diagSel=b.dataset.t; diagBuildParams();
+    document.querySelectorAll('.diagT').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+  }));
+  diagBuildParams();
+}
+function diagBuildParams(){
+  const t=DIAG_BYNAME[diagSel];
+  $('diagParams').innerHTML = t[2].length ? t[2].map(f=>
+    `<label>${f[1]}<input id="dp_${f[0]}" value="${f[2]==='hex'?f[3]:f[3]}"></label>`
+  ).join('') : '<span class="muted">no parameters</span>';
+}
+function diagParams(){
+  const t=DIAG_BYNAME[diagSel], out={};
+  t[2].forEach(f=>{
+    const v=$('dp_'+f[0]).value;
+    out[f[0]] = f[2]==='hex' ? parseInt(v,16) : Number(v);
+  });
+  // the two eye-scan buttons are one library function with a method argument
+  if(diagSel.startsWith('eye_scan')) out.method = diagSel.endsWith('fpga')?'fpga':'host';
+  return out;
+}
+function diagRunTest(){
+  if(diagRunning)return;
+  const name = diagSel.startsWith('eye_scan') ? 'eye_scan' : diagSel;
+  const p=diagParams();
+  const LONG={dco_sweep:'a DCO sweep runs a full eye scan for every 0x17 setting',
+              ramp_check:'this runs for '+(p.seconds||0)+' s',
+              stream_selftest:'this streams for '+(p.seconds||0)+' s'};
+  if(LONG[diagSel] && !confirm(LONG[diagSel]+'. Acquisition stays stopped throughout. Run it?'))return;
+  diagPoints=[]; diagResult=null; $('diagTable').innerHTML='';
+  diagPost('run',{test:name,params:p}).then(({ok,j})=>{
+    if(!ok){diagSay(j.error||'failed to start','v-bad');return;}
+    diagRunning=true; $('diagRun').disabled=true; $('diagCancel').disabled=false;
+    document.querySelectorAll('.diagT').forEach(b=>b.disabled=true);
+    diagPoll=diagPoll||setInterval(diagProgress,300);
+  });
+}
+function diagProgress(){
+  fetch('/diag/progress?since='+diagPoints.length).then(r=>r.json()).then(d=>{
+    if(d.points && d.points.length) diagPoints=diagPoints.concat(d.points);
+    $('diagBar').style.width=(100*(d.frac||0)).toFixed(1)+'%';
+    if(d.test){ diagSay(d.msg||'running','v-warn'); diagDraw(); return; }
+    // finished
+    if(diagPoll){clearInterval(diagPoll);diagPoll=null;}
+    diagRunning=false; $('diagRun').disabled=false; $('diagCancel').disabled=true;
+    document.querySelectorAll('.diagT').forEach(b=>b.disabled=false);
+    if(d.error){diagSay(d.error,'v-bad');$('diagVerdict').textContent='';
+                $('diagSummary').textContent=d.error; diagDraw(); return;}
+    diagResult=d.result; diagSay('done','v-good'); diagShow(d.result);
+  }).catch(()=>{});
+}
+function diagShow(r){
+  if(!r)return;
+  $('diagVerdict').textContent = r.ok===true?'PASS':(r.ok===false?'FAIL':'');
+  $('diagVerdict').className = r.ok===true?'v-good':(r.ok===false?'v-bad':'');
+  $('diagSummary').textContent = r.summary||'';
+  if(r.rows && r.rows.length) diagPoints = r.rows;
+  diagDraw();
+  // register dump gets a table; everything else is summarised by the plot
+  if(r.name==='register_dump'){
+    $('diagTable').innerHTML='<table>'+
+      '<tr><th>addr</th><th>hex</th><th>binary</th><th>name</th></tr>'+
+      r.rows.map(x=>`<tr><td>${x[0]}</td><td class="mono">${x[1]}</td>`+
+        `<td class="mono">${x[2]}</td><td>${x[3]||''}${x[4]?' *':''}</td></tr>`).join('')+
+      '</table><div class="muted">* shadowed: a write needs a transfer</div>';
+  } else if(r.name==='channel_quality' && r.data){
+    const f=(o,k,d)=>o&&o[k]!==undefined?(+o[k]).toFixed(d):'—';
+    $('diagTable').innerHTML='<table>'+
+      ['freq_hz','amplitude_codes','residual_rms_lsb','outliers_6sigma','snr_db','sfdr_db']
+      .map(k=>`<tr><td>${k}</td><td class="mono">${f(r.data.A,k,3)}</td>`+
+              `<td class="mono">${f(r.data.B,k,3)}</td></tr>`).join('')+
+      '</table><div class="muted">columns: channel A, channel B — signal on '+
+      (r.data.carrier||'?')+'</div>';
+  }
+}
+// One canvas serves every test: errors-vs-tap, counters-vs-time, or a heatmap.
+function diagDraw(){
+  const c=$('diagPlot'); if(!c)return;
+  const w=c.clientWidth||900; if(c.width!==w)c.width=w;
+  const h=c.height, g=c.getContext('2d');
+  g.clearRect(0,0,w,h); g.fillStyle='#0b1412'; g.fillRect(0,0,w,h);
+  const pts=diagPoints; if(!pts.length){return;}
+  const r=diagResult;
+  if(r && r.name==='dco_sweep'){ diagHeat(g,w,h,r); return; }
+  const isTime = r ? r.name==='ramp_check' : false;
+  const xs=pts.map(p=>p[0]), ya=pts.map(p=>p[1]||0), yb=pts.map(p=>p[2]||0);
+  const x0=Math.min(...xs), x1=Math.max(...xs)||1;
+  const ymax=Math.max(1,...ya,...yb);
+  const X=v=>40+(w-55)*(v-x0)/((x1-x0)||1);
+  const Y=v=>h-24-(h-40)*Math.log10(1+v)/Math.log10(1+ymax);
+  // zero-error taps shaded, so the eye is visible at a glance
+  if(!isTime){
+    g.fillStyle='rgba(44,160,44,.16)';
+    pts.forEach((p,i)=>{ if((p[1]||0)===0&&(p[2]||0)===0){
+      const xa=X(p[0]), xb2=i+1<pts.length?X(pts[i+1][0]):xa+2; g.fillRect(xa,10,Math.max(1,xb2-xa),h-34);} });
+  }
+  g.strokeStyle='#2a3a37'; g.lineWidth=1; g.beginPath();
+  g.moveTo(40,h-24); g.lineTo(w-15,h-24); g.stroke();
+  [['#4ea3ff',ya],['#ff9f4e',yb]].forEach(([col,ys])=>{
+    g.strokeStyle=col; g.lineWidth=1.4; g.beginPath();
+    ys.forEach((v,i)=>{ const x=X(xs[i]),y=Y(v); i?g.lineTo(x,y):g.moveTo(x,y); });
+    g.stroke();
+  });
+  if(r && r.data && r.data.found){
+    const cx=X(r.data.centre); g.strokeStyle='#eee'; g.setLineDash([4,3]);
+    g.beginPath(); g.moveTo(cx,8); g.lineTo(cx,h-24); g.stroke(); g.setLineDash([]);
+    g.fillStyle='#eee'; g.font='11px monospace';
+    g.fillText('centre '+r.data.centre,cx+4,20);
+  }
+  g.fillStyle='#8aa'; g.font='11px monospace';
+  g.fillText(isTime?'t (s)':'IDELAY tap',w/2-30,h-8);
+  g.fillText('errors (log)',4,12);
+  g.fillStyle='#4ea3ff'; g.fillText('A',w-26,16);
+  g.fillStyle='#ff9f4e'; g.fillText('B',w-14,16);
+}
+function diagHeat(g,w,h,r){
+  const grid=r.data.grid||[], labels=r.data.labels||[];
+  if(!grid.length)return;
+  const rows=grid.length, cols=grid[0].length;
+  const cw=(w-70)/cols, ch=(h-34)/rows;
+  let mx=1; grid.forEach(row=>row.forEach(v=>{if(v>mx)mx=v;}));
+  for(let i=0;i<rows;i++)for(let j=0;j<cols;j++){
+    const v=grid[i][j], t=Math.log10(1+v)/Math.log10(1+mx);
+    g.fillStyle = v===0 ? '#1e6b3a' : `rgb(${Math.round(60+195*t)},${Math.round(70-40*t)},${Math.round(70-40*t)})`;
+    g.fillRect(60+j*cw,8+i*ch,Math.max(1,cw),Math.max(1,ch));
+  }
+  g.fillStyle='#8aa'; g.font='10px monospace';
+  labels.forEach((L,i)=>g.fillText(L,4,8+i*ch+ch*0.7));
+  g.fillText('tap ->',w/2-15,h-8);
+  g.fillText('green = zero errors',w-150,h-8);
+}
+
+$('diagRun').addEventListener('click',diagRunTest);
+$('diagCancel').addEventListener('click',()=>diagPost('cancel',{}));
+$('diagClear').addEventListener('click',()=>diagPost('clear',{}).then(diagStatus));
+$('diagTapSet').addEventListener('click',()=>
+  diagPost('tap',{tap:+$('diagTap').value}).then(({ok,j})=>{
+    diagSay(ok?'tap applied':(j.error||'failed'),ok?'v-good':'v-bad'); diagStatus();}));
+$('diagTapSave').addEventListener('click',()=>
+  diagPost('tap',{tap:+$('diagTap').value,save:true}).then(({ok,j})=>{
+    diagSay(ok?'tap saved as default':(j.error||'failed'),ok?'v-good':'v-bad'); diagStatus();}));
+$('diagCsv').addEventListener('click',()=>window.open('/diag/result.csv'));
+$('diagJson').addEventListener('click',()=>window.open('/diag/result.json'));
+
+// ---- Step 5: pattern selector and capture graph
+opts($('diagCapN'),[1024,4096,16384,65536],v=>v.toLocaleString()+' pairs',4096);
+$('diagPattern').addEventListener('change',()=>{
+  diagPost('pattern',{pattern:+$('diagPattern').value}).then(({ok,j})=>{
+    diagSay(ok?('pattern 0x'+(+$('diagPattern').value).toString(16)):(j.error||'failed'),
+            ok?'v-good':'v-bad');
+    diagStatus(); diagCapture();
+  });
+});
+$('diagCap').addEventListener('click',diagCapture);
+$('diagAuto').addEventListener('change',e=>{
+  if(diagAutoT){clearInterval(diagAutoT);diagAutoT=null;}
+  if(e.target.checked) diagAutoT=setInterval(diagCapture,500);
+});
+function diagCapture(){
+  if(diagRunning)return;
+  diagPost('run',{test:'pattern_capture',params:{npairs:+$('diagCapN').value}})
+    .then(({ok,j})=>{
+      if(!ok){diagSay(j.error||'capture failed','v-bad');return;}
+      const wait=setInterval(()=>{
+        fetch('/diag/progress').then(r=>r.json()).then(d=>{
+          if(d.test)return;
+          clearInterval(wait);
+          if(d.error){diagSay(d.error,'v-bad');return;}
+          diagPatData=d.result; diagDrawPattern();
+        }).catch(()=>{clearInterval(wait);});
+      },150);
+    });
+}
+function diagDrawPattern(){
+  const r=diagPatData; if(!r||!r.data)return;
+  const D=r.data, A_=D.channels.A, B_=D.channels.B;
+  // --- trace
+  const c=$('diagPatPlot'); const w=c.clientWidth||900; if(c.width!==w)c.width=w;
+  const h=c.height, g=c.getContext('2d');
+  g.clearRect(0,0,w,h); g.fillStyle='#0b1412'; g.fillRect(0,0,w,h);
+  const n=Math.min(A_.decoded.length,2048);
+  const all=A_.decoded.slice(0,n).concat(B_.decoded.slice(0,n));
+  let lo=Math.min(...all), hi=Math.max(...all);
+  if(hi===lo){hi=lo+1;}
+  const X=i=>34+(w-45)*i/(n-1||1), Y=v=>h-20-(h-32)*(v-lo)/(hi-lo);
+  g.strokeStyle='#2a3a37'; g.beginPath(); g.moveTo(34,h-20); g.lineTo(w-10,h-20); g.stroke();
+  [['#4ea3ff',A_.decoded],['#ff9f4e',B_.decoded]].forEach(([col,ys])=>{
+    g.strokeStyle=col; g.lineWidth=1.2; g.beginPath();
+    for(let i=0;i<n;i++){const x=X(i),y=Y(ys[i]); i?g.lineTo(x,y):g.moveTo(x,y);}
+    g.stroke();
+  });
+  g.fillStyle='#8aa'; g.font='11px monospace';
+  g.fillText(String(hi),2,12); g.fillText(String(lo),2,h-24);
+  g.fillText('sample index (decoded codes)',w/2-70,h-6);
+  // --- per-bit activity: a stuck or swapped bit is obvious here
+  const cb=$('diagBits'); if(cb.width!==w)cb.width=w;
+  const hb=cb.height, gb=cb.getContext('2d');
+  gb.clearRect(0,0,w,hb); gb.fillStyle='#0b1412'; gb.fillRect(0,0,w,hb);
+  const bw=(w-50)/30;
+  // A bit that never toggles is only EVIDENCE of a fault when the pattern was
+  // supposed to exercise it. A ramp spanning 2048 codes leaves the top bits
+  // constant by construction, and a constant pattern leaves all of them
+  // constant -- flagging those red cried wolf. Only the PN sequences drive
+  // every bit, so only there does a stuck bit mean something.
+  const exercises = (D.pattern===0x05||D.pattern===0x06);
+  [['A',A_.bit_ones,'#4ea3ff',0],['B',B_.bit_ones,'#ff9f4e',15]].forEach(([nm,bits,col,off])=>{
+    bits.forEach((f,b)=>{
+      const x=40+(off+ (13-b))*bw, bh=(hb-34)*f;
+      gb.fillStyle = (exercises && (f<0.01||f>0.99)) ? '#d64541' : col;
+      gb.fillRect(x,hb-22-bh,Math.max(1,bw-2),bh);
+    });
+    gb.fillStyle='#8aa'; gb.font='10px monospace';
+    gb.fillText(nm,40+off*bw,hb-8);
+  });
+  gb.fillStyle='#8aa'; gb.font='10px monospace';
+  gb.fillText('fraction of ones per bit, MSB left'
+    + (exercises ? '  (red = stuck; PN drives every bit)'
+                 : '  (constant top bits are expected unless the pattern spans full scale)'),4,12);
+  gb.strokeStyle='#2a3a37'; gb.beginPath();
+  gb.moveTo(40,hb-22-(hb-34)*0.5); gb.lineTo(w-10,hb-22-(hb-34)*0.5); gb.stroke();
+  // --- raw words and the pattern check
+  $('diagRaw').textContent =
+    `A hex  ${A_.hex64.slice(0,16).join(' ')}\n`+
+    `A bin  ${A_.bin64.slice(0,4).join('  ')}\n`+
+    `B hex  ${B_.hex64.slice(0,16).join(' ')}\n`+
+    `B bin  ${B_.bin64.slice(0,4).join('  ')}`;
+  const dev = (A_.deviations===null)
+    ? `no closed-form law — ${A_.law}`
+    : `A ${A_.deviations} / B ${B_.deviations} deviations from ${A_.law}`;
+  $('diagPatInfo').innerHTML =
+    `<b>${D.pattern_name}</b> (0x0D = 0x${D.pattern.toString(16).toUpperCase().padStart(2,'0')}) — ${dev}. `+
+    `0x14 = 0x${D.output_mode.toString(16).toUpperCase().padStart(2,'0')}, output `+
+    `<b>${D.output_invert?'INVERTED':'normal'}</b> — decoded codes above have the inversion undone `+
+    `(sample = −x−1). A: ${A_.unique} unique, mean ${A_.decoded_mean.toFixed(1)}; `+
+    `B: ${B_.unique} unique, mean ${B_.decoded_mean.toFixed(1)}.`;
+}
+
+// ADC front-end controls. These talk to /adc/control, not /control: they
+// touch the converter and the delay line rather than the capture settings,
+// and the ramp test has to pause acquisition, so it must not look like an
+// ordinary config change.
+function adcPost(body,cb){
+  fetch('/adc/control',{method:'POST',headers:{'Content-Type':'application/json'},
+                        body:JSON.stringify(body)})
+    .then(r=>r.json().then(j=>({ok:r.ok,j})))
+    .then(({ok,j})=>{ if(cb)cb(ok,j); })
+    .catch(e=>{ if(cb)cb(false,{error:String(e)}); });
+}
+function adcRampOut(t,cls){
+  const el=$('adc_ramp_out'); if(!el)return;
+  el.textContent=t; el.className=cls||'muted';
+}
+$('adc_tap_set').addEventListener('click',()=>{
+  adcPost({tap:+$('adc_tap').value},(ok,j)=>{
+    if(!ok)adcRampOut(j.error||'tap failed','v-bad');
+  });
+});
+$('adc_tap_save').addEventListener('click',()=>{
+  adcPost({tap:+$('adc_tap').value,save_tap:true},(ok,j)=>{
+    adcRampOut(ok?'tap saved':(j.error||'save failed'),ok?'v-good':'v-bad');
+  });
+});
+$('adc_ramp').addEventListener('click',()=>{
+  adcRampOut('running 5 s...','v-warn');
+  adcPost({ramp_test:5},(ok,j)=>{
+    if(!ok){adcRampOut(j.error||'failed','v-bad');return;}
+    const poll=setInterval(()=>{
+      fetch('/adc').then(r=>r.json()).then(d=>{
+        const rt=(d.health||{}).ramp_test;
+        if(!rt||rt.running)return;
+        clearInterval(poll);
+        if(rt.error){adcRampOut(rt.error,'v-bad');return;}
+        adcRampOut(rt.pass
+          ? `PASS — 0 deviations in ${(rt.samples||0).toLocaleString()} samples`
+          : `FAIL A=${rt.errors_a.toLocaleString()} B=${rt.errors_b.toLocaleString()}`,
+          rt.pass?'v-good':'v-bad');
+      }).catch(()=>{});
+    },1000);
+  });
+});
+opts($('fps'),[1,2,5,10,15,20,30,60],v=>v+' fps',20);
+opts($('stream_window'),[0,524288,2097152,8388608],
+     v=>v===0?'full record':(v/1048576)+' M samples',0);
+const CTL_IDS=['mode','fps','trace_span_ring','stream_window','disp_log','channel','nsamples','nfft','avg','max_frames','classify','pfa_exp'];
 const pending={};
 function markPending(id){
   pending[id]=$(id).value;
@@ -431,7 +996,6 @@ CTL_IDS.forEach(id=>$(id).addEventListener('change',()=>{
     return;
   }
   markPending(id);send({[id]:+raw});
-  if(id==='speed'){buildNsampleOpts(MAX_SAMPLES)}
   if(id==='nsamples'){
     const prevRaw=$('nfft').value;
     buildNfftOpts(+raw);                   // manual nfft is capped at nsamples
@@ -667,7 +1231,14 @@ function drawFreq(m,T,zoomSpec){
   // 0.6% of the width, so a sparse low end looks identical to an empty one
   // and the tick labels jump 10k -> 2.7M. Use log whenever the band covers
   // more than a decade and starts above DC.
-  const useLog=!zoomed||(fLo>0&&fHi/fLo>=10);
+  // The overview's spacing is chosen server-side and reported in disp_log;
+  // the axis must match it exactly or every point lands at the wrong
+  // frequency. A zoom is a full-resolution linear slice, so there the choice
+  // is free -- keep log only when the span is wide enough to need it AND the
+  // user has not asked for linear.
+  const wantLog=(m.disp_log!==false);
+  { const el=$('specAxis'); if(el) el.textContent = wantLog?'— log/log':'— linear/log'; }
+  const useLog=zoomed?(wantLog&&fLo>0&&fHi/fLo>=10):wantLog;
 
   let lo=Infinity,hi=-Infinity;
   for(let i=0;i<n;i++){const v=spec[i];if(v<lo)lo=v;if(v>hi)hi=v} // overview already excludes DC
@@ -737,7 +1308,7 @@ function drawFreq(m,T,zoomSpec){
     c.fillText(`${eng(m.sig.peak_hz)}  ${f(m.sig.peak_db,1)} dBFS`,x+(x>w*.7?-6:6),g.y0+12)}
   $('fdInfo').innerHTML=zoomed
     ?`zoom ${axFreq(fLo)}–${axFreq(fHi)} · ${n.toLocaleString()} pts full-res · ${eng(binHz)}/bin · ${useLog?'log':'linear'}`
-    :traceLegend(T)+`${persistTau?(persistTau<0?'HOLD · ':'PERSIST '+persistTau+'s · '):''}${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · log/log`;
+    :traceLegend(T)+`${persistTau?(persistTau<0?'HOLD · ':'PERSIST '+persistTau+'s · '):''}${m.nframes}× ${m.cfg.nfft.toLocaleString()}-pt (${fmtDur(m.cfg.nfft/m.fs_hz)} → Δf ${eng(m.bin_hz)}) · analysed ${fmtDur(m.nframes*m.cfg.nfft/m.fs_hz)} of ${fmtDur(m.cfg.nsamples/m.fs_hz)} · Hann · ${m.disp_log===false?'lin':'log'}/log`;
   drawThreshold(m,g,Y,pxN);
   drawNoiseMarkers(m,g,Xf,Y,fLo,fHi,pts,pxN);
   $('bZoomReset').style.display=zoomed?'':'none';
@@ -974,6 +1545,43 @@ function render(m,T,zoomSpec){
     ['DMA path',(a.dma_path||'').split(' ')[0],
        (a.dma_path||'').includes('failed')?'v-bad':''],
     ['GPU (wall)',f(a.gpu_wall_ms,3)+' ms'],
+    // --- ADC front end. These are the bits that say the numbers above are
+    // meaningless: on 2026-09-29 the LVDS capture was dead (every sample a
+    // constant) with IDELAYCTRL not ready, and the spectrum simply looked
+    // like a very quiet input.
+    ...(m.adc && m.adc.present ? [
+      ['— ADC —',''],
+      ['design ID','0x'+(m.adc.design_id>>>0).toString(16).toUpperCase().padStart(8,'0')],
+      ['capture clock',m.adc.clk_locked?'locked':'NOT LOCKED',
+         m.adc.clk_locked?'v-good':'v-bad'],
+      ['IDELAYCTRL',m.adc.idelay_ready?'ready':'NOT READY',
+         m.adc.idelay_ready?'v-good':'v-bad'],
+      ['overrange A',m.adc.overrange_a?'YES':'no',m.adc.overrange_a?'v-bad':'v-good'],
+      ['overrange B',m.adc.overrange_b?'YES':'no',m.adc.overrange_b?'v-bad':'v-good'],
+      ['IDELAY tap',m.adc.tap_requested+' requested, '+m.adc.tap_readback+' read back',
+         (m.adc.tap_requested===m.adc.tap_readback)?'':'v-warn'],
+    ] : (m.adc ? [['— ADC —',m.adc.reason||'unavailable','v-warn']] : [])),
+    // --- streaming. `lost` and the reg6 flags are the ones that matter: in
+    // stream mode a display that cannot keep up shows OLDER data rather than
+    // fewer frames, so loss is otherwise invisible.
+    ...(m.stream && m.stream.mode==='stream' ? [
+      ['— stream —',''],
+      ['segments read',m.stream.segments.toLocaleString()],
+      ['segments lost',m.stream.lost.toLocaleString(),
+         m.stream.lost?'v-bad':'v-good'],
+      ['host rate',f(m.stream.rate_gbps,2)+' / '+f(m.stream.needed_gbps,2)+' GB/s',
+         m.stream.rate_gbps>=m.stream.needed_gbps*0.98?'v-good':'v-warn'],
+      ['segment period',f(m.stream.seg_period_ms,1)+' ms'],
+      ['RAM ring',f(m.stream.ring_gb,2)+' GB · '+f(m.stream.ring_seconds,1)+' s · '
+         +m.stream.ring_segments+' seg'],
+      ['evicted (oldest)',m.stream.evicted.toLocaleString()],
+      ['data age',f(m.stream.age_ms,0)+' ms',m.stream.age_ms<300?'v-good':'v-warn'],
+      ['ring overrun',m.stream.overrun?'YES':'no',m.stream.overrun?'v-bad':'v-good'],
+      ['FIFO overflow',m.stream.fifo_overflow?'YES':'no',
+         m.stream.fifo_overflow?'v-bad':'v-good'],
+      ['late frames',(m.stream.frames_late||0).toLocaleString(),
+         m.stream.frames_late?'v-warn':'v-good'],
+    ] : []),
     ['loop total','<b>'+f(a.loop_ms,3)+'</b> ms'],
     ['frame rate','<b>'+f(a.fps,1)+'</b> /s'],
     ['duty cycle',f(a.duty_pct,1)+' %'],
@@ -999,7 +1607,7 @@ function render(m,T,zoomSpec){
   if(m.dual){
     const rows=Object.entries(m.dual).map(([k,v])=>
       [`ch ${k}`,`${f(v.mean,1)} ± ${f(v.std,2)} (${v.min}–${v.max})`,
-       (v.max>=16380||v.min<=2)?'v-bad':'']);
+       (v.max>=8190||v.min<=-8190)?'v-bad':'']);
     fill($('tSig'),rows.concat([['—','both captured in the same window']]));
   } else
   fill($('tSig'),[
@@ -1023,7 +1631,13 @@ function render(m,T,zoomSpec){
     ['RAM',si(y.mem_used)+' / '+si(y.mem_total)],
     ...tmp,
   ]);
-  $('stFps').textContent=m.engine.running?f(a.fps,1)+' fps':'single-shot';
+  if(m.adc && m.adc.present){
+    const box=$('adc_tap');
+    if(box && document.activeElement!==box) box.value=m.adc.tap_requested;
+  }
+  $('stFps').textContent=m.engine.running
+      ? f(a.fps,1)+' fps'+(m.stream&&m.stream.mode==='stream'?' · stream':' · block')
+      : 'single-shot';
   {
     const nn=(y||{}).net;
     let txt='net: wired/local';
@@ -1578,4 +2192,13 @@ pnPoll();
 
 window.addEventListener('resize',()=>{});
 poll();
+document.addEventListener('visibilitychange',()=>{
+  // Coming back from a hidden tab: take the board back at once rather than
+  // leaving the first click to fail and retry.
+  if(!document.hidden && diagActive) diagPost('keepalive',{}).then(diagStatus);
+});
+window.addEventListener('beforeunload',()=>{
+  if(diagActive){ navigator.sendBeacon('/diag/leave',
+      new Blob([JSON.stringify({token:DIAG_TOKEN})],{type:'application/json'})); }
+});
 </script></body></html>
